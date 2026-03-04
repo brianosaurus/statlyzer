@@ -10,7 +10,7 @@ from typing import Optional
 import numpy as np
 
 from constants import WELL_KNOWN_TOKENS
-from signal import Signal
+from signals import Signal
 
 logger = logging.getLogger(__name__)
 
