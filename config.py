@@ -26,7 +26,7 @@ class Config:
     wallet_keypair_path: str = os.getenv('WALLET_KEYPAIR_PATH', '')
 
     # Scanner DB (read cointegrated pairs from here)
-    scanner_db_path: str = os.getenv('SCANNER_DB_PATH', '../cointegration_scanner/arb_tracker.db')
+    scanner_db_path: str = os.getenv('SCANNER_DB_PATH', '../arbitrage_tracker/arb_tracker.db')
 
     # Signal thresholds
     entry_zscore: float = float(os.getenv('ENTRY_ZSCORE', '2.0'))

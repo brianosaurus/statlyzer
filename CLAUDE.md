@@ -15,7 +15,7 @@ Statalyzer — statistical arbitrage bot for Solana. Monitors cointegrated token
 pip install -r requirements.txt
 
 # Paper trading (default)
-python statalyzer.py --monitor --scanner-db ../cointegration_scanner/arb_tracker.db
+python statalyzer.py --monitor --scanner-db ../arbitrage_tracker/arb_tracker.db
 
 # Custom capital
 python statalyzer.py --monitor --capital 5000
@@ -64,4 +64,4 @@ Key modules:
 
 ## Upstream Dependency
 
-Requires cointegration_scanner's DB (default: `../cointegration_scanner/arb_tracker.db`) with `cointegration_results` table containing cointegrated pairs, hedge ratios, and half-lives.
+Requires cointegration_scanner's DB (default: `../arbitrage_tracker/arb_tracker.db`) with `cointegration_results` table containing cointegrated pairs, hedge ratios, and half-lives.
