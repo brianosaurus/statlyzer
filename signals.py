@@ -168,8 +168,8 @@ class SignalGenerator:
             mint_a = p['token_a_mint']
             mint_b = p['token_b_mint']
 
-            # Well-known token filter: require BOTH tokens to be known
-            if mint_a not in WELL_KNOWN_TOKENS or mint_b not in WELL_KNOWN_TOKENS:
+            # Well-known token filter: require at least ONE token to be known
+            if mint_a not in WELL_KNOWN_TOKENS and mint_b not in WELL_KNOWN_TOKENS:
                 skipped_unknown += 1
                 continue
 

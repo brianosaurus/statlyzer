@@ -182,6 +182,20 @@ JITOSOL_MINT = "J1toso1uCk3RLmjorhTtrVwY9HJ7X8V9yYac6Y7kGCPn"
 BSOL_MINT = "bSo13r4TkiE4KumL71LsHTPpL2euBYLFx6h9HP3piy1"
 JUPSOL_MINT = "jupSoLaHXQiZZTSfEWMTRRgpnyFm8f6sZdosWBjx93v"
 
+# Additional established tokens
+WIF_MINT = "EKpQGSJtjMFqKZ9KQanSqYXRcF8fBopzLHYxdM65zcjm"
+JUP_MINT = "JUPyiwrYJFskUPiHa7hkeR8VUtAeFoSYbKedZNsDvCN"
+PYTH_MINT = "HZ1JovNiVvGrGNiiYvEozEVgZ58xaU3RKwX8eACQBCt3"
+ORCA_MINT = "orcaEKTdK7LKz57vaAYr9QeNsVEPfiu6QeMU1kektZE"
+WEN_MINT = "WENWENvqqNya429ubCdR81ZmD69brwQaaBYY6p3LCpk"
+RENDER_MINT = "rndrizKT3MK1iimdxRdWabcF7Zg7AR5T4nud4EkHBof"
+HNT_MINT = "hntyVP6YFm1Hg25TN9WGLqM12b8TQmcknKrdu1oxWux"
+TRUMP_MINT = "HaP8r3ksG76PhQLTqR8FYBeNiQpejcFbQmiHbg787Ut1"
+FARTCOIN_MINT = "9BB6NFEcjBCtnNLFko2FqVQBq8HHM13kCyYcdQbgpump"
+MEW_MINT = "MEW1gQWJ3nEXg2qgERiKu7FAFj79PHvQVREQUzScPP5"
+AI16Z_MINT = "HeLp6NuQkmYB4pYWo2zYs22mESHXPQYzXbB8n4V98jwC"
+POPCAT_MINT = "7GCihgDB8fe6KNjn2MYtkzZcRjQy3t9GHdC8uHYmW2hr"
+
 # Well-known token metadata
 WELL_KNOWN_TOKENS = {
     SOL_MINT: {"symbol": "SOL", "name": "Solana", "decimals": 9},
@@ -198,6 +212,18 @@ WELL_KNOWN_TOKENS = {
     JITOSOL_MINT: {"symbol": "jitoSOL", "name": "Jito Staked SOL", "decimals": 9},
     BSOL_MINT: {"symbol": "bSOL", "name": "Blaze SOL", "decimals": 9},
     JUPSOL_MINT: {"symbol": "jupSOL", "name": "Jupiter SOL", "decimals": 9},
+    WIF_MINT: {"symbol": "WIF", "name": "dogwifhat", "decimals": 6},
+    JUP_MINT: {"symbol": "JUP", "name": "Jupiter", "decimals": 6},
+    PYTH_MINT: {"symbol": "PYTH", "name": "Pyth Network", "decimals": 6},
+    ORCA_MINT: {"symbol": "ORCA", "name": "Orca", "decimals": 6},
+    WEN_MINT: {"symbol": "WEN", "name": "Wen", "decimals": 5},
+    RENDER_MINT: {"symbol": "RENDER", "name": "Render", "decimals": 8},
+    HNT_MINT: {"symbol": "HNT", "name": "Helium", "decimals": 8},
+    TRUMP_MINT: {"symbol": "TRUMP", "name": "Official Trump", "decimals": 6},
+    FARTCOIN_MINT: {"symbol": "FARTCOIN", "name": "Fartcoin", "decimals": 6},
+    MEW_MINT: {"symbol": "MEW", "name": "cat in a dogs world", "decimals": 5},
+    AI16Z_MINT: {"symbol": "ai16z", "name": "ai16z", "decimals": 9},
+    POPCAT_MINT: {"symbol": "POPCAT", "name": "Popcat", "decimals": 9},
 }
 
 # Stablecoin mints (for quote-token normalization)
