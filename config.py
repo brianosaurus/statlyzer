@@ -29,9 +29,9 @@ class Config:
     scanner_db_path: str = os.getenv('SCANNER_DB_PATH', '../arbitrage_tracker/arb_tracker.db')
 
     # Signal thresholds
-    entry_zscore: float = float(os.getenv('ENTRY_ZSCORE', '2.0'))
+    entry_zscore: float = float(os.getenv('ENTRY_ZSCORE', '2.5'))
     exit_zscore: float = float(os.getenv('EXIT_ZSCORE', '0.5'))
-    stop_loss_zscore: float = float(os.getenv('STOP_LOSS_ZSCORE', '4.0'))
+    stop_loss_zscore: float = float(os.getenv('STOP_LOSS_ZSCORE', '5.0'))
 
     # Position sizing
     sizing_method: str = os.getenv('SIZING_METHOD', 'fixed_fraction')
@@ -56,6 +56,6 @@ class Config:
 
     # Mode
     paper_trade: bool = os.getenv('PAPER_TRADE', 'true').lower() == 'true'
-    lookback_window: int = int(os.getenv('LOOKBACK_WINDOW', '500'))
-    entry_cooldown_slots: int = int(os.getenv('ENTRY_COOLDOWN_SLOTS', '300'))
+    lookback_window: int = int(os.getenv('LOOKBACK_WINDOW', '2500'))
+    entry_cooldown_slots: int = int(os.getenv('ENTRY_COOLDOWN_SLOTS', '750'))
     initial_capital: float = float(os.getenv('INITIAL_CAPITAL', '10000'))

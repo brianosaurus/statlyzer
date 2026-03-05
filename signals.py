@@ -139,7 +139,12 @@ class SignalGenerator:
             logger.warning("No cointegrated pairs found in scanner DB")
             return 0
 
+        # Track which base tokens already have a stablecoin pair (dedup USDC/USDT/USDH)
+        base_with_stable: Dict[str, str] = {}  # base_mint -> preferred quote mint
+
         loaded = 0
+        skipped_dup = 0
+        skipped_unknown = 0
         for p in pairs_data:
             # Half-life filter
             hl = p.get('half_life', float('inf'))
@@ -160,7 +165,35 @@ class SignalGenerator:
             if age_hours > self.config.pair_staleness_hours:
                 continue
 
-            pair_key = make_pair_key(p['token_a_mint'], p['token_b_mint'])
+            mint_a = p['token_a_mint']
+            mint_b = p['token_b_mint']
+
+            # Well-known token filter: require BOTH tokens to be known
+            if mint_a not in WELL_KNOWN_TOKENS or mint_b not in WELL_KNOWN_TOKENS:
+                skipped_unknown += 1
+                continue
+
+            # Stablecoin deduplication: if base/USDC exists, skip base/USDT and base/USDH
+            stable_mints = STABLECOIN_MINTS
+            base_mint = mint_a if mint_b in stable_mints else (mint_b if mint_a in stable_mints else None)
+            quote_mint = mint_b if mint_b in stable_mints else (mint_a if mint_a in stable_mints else None)
+            if base_mint and quote_mint:
+                existing_quote = base_with_stable.get(base_mint)
+                if existing_quote:
+                    # Already have a stablecoin pair for this base — prefer by QUOTE_PRIORITY
+                    existing_prio = QUOTE_PRIORITY.index(existing_quote) if existing_quote in QUOTE_PRIORITY else 99
+                    new_prio = QUOTE_PRIORITY.index(quote_mint) if quote_mint in QUOTE_PRIORITY else 99
+                    if new_prio >= existing_prio:
+                        skipped_dup += 1
+                        continue
+                    # New quote has higher priority — remove old pair and use this one
+                    old_key = make_pair_key(base_mint, existing_quote)
+                    if old_key in self.pairs:
+                        del self.pairs[old_key]
+                        loaded -= 1
+                base_with_stable[base_mint] = quote_mint
+
+            pair_key = make_pair_key(mint_a, mint_b)
 
             if pair_key in self.pairs:
                 # Update existing pair's params
@@ -170,10 +203,10 @@ class SignalGenerator:
             else:
                 state = PairState(
                     pair_key=pair_key,
-                    token_a_mint=p['token_a_mint'],
-                    token_b_mint=p['token_b_mint'],
-                    token_a_symbol=p.get('token_a_symbol', token_symbol(p['token_a_mint'])),
-                    token_b_symbol=p.get('token_b_symbol', token_symbol(p['token_b_mint'])),
+                    token_a_mint=mint_a,
+                    token_b_mint=mint_b,
+                    token_a_symbol=p.get('token_a_symbol', token_symbol(mint_a)),
+                    token_b_symbol=p.get('token_b_symbol', token_symbol(mint_b)),
                     hedge_ratio=p['hedge_ratio'],
                     half_life=hl,
                     eg_p_value=p.get('eg_p_value', 1.0),
@@ -182,9 +215,13 @@ class SignalGenerator:
                 state.init_buffers(self.config.lookback_window)
                 self.pairs[pair_key] = state
 
-            self.monitored_mints.add(p['token_a_mint'])
-            self.monitored_mints.add(p['token_b_mint'])
+            self.monitored_mints.add(mint_a)
+            self.monitored_mints.add(mint_b)
             loaded += 1
+
+        if skipped_dup or skipped_unknown:
+            logger.info(f"Skipped {skipped_dup} duplicate stablecoin pairs, "
+                        f"{skipped_unknown} pairs with no well-known token")
 
         self.last_pair_reload = time.time()
         logger.info(f"Loaded {loaded} cointegrated pairs, monitoring {len(self.monitored_mints)} tokens")
