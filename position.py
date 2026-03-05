@@ -90,6 +90,12 @@ class PositionSizer:
         if raw_a <= 0 or raw_b <= 0:
             return None
 
+        # Guard against SQLite INTEGER overflow (max 2^63-1)
+        max_raw = 2**63 - 1
+        if raw_a > max_raw or raw_b > max_raw:
+            logger.warning(f"Raw quantity overflow for {signal.token_a_symbol}/{signal.token_b_symbol}, skipping")
+            return None
+
         return PositionSize(
             token_a_amount=amount_a,
             token_b_amount=amount_b,

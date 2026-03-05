@@ -138,6 +138,12 @@ async def run_monitor(config: Config, args):
         db.close()
         return
 
+    # Sync position state: mark pairs that have open positions
+    for pair_key in portfolio.positions:
+        pair_state = signal_gen.get_pair_states().get(pair_key)
+        if pair_state:
+            pair_state.in_position = True
+
     # Persist initial capital
     portfolio.save_capital()
 
@@ -206,6 +212,10 @@ async def run_monitor(config: Config, args):
                     risk_mgr.record_entry()
                     stats['trades'] += 1
 
+                    # Mark pair as in-position for signal filtering
+                    pair_state.in_position = True
+                    pair_state.position_entry_slot = slot
+
                     print_entry(sig, position, execution)
 
                 elif sig.signal_type in (SignalType.EXIT, SignalType.STOP_LOSS):
@@ -236,15 +246,50 @@ async def run_monitor(config: Config, args):
                     closed = portfolio.close_position(sig.pair_key, sig.zscore, slot, reason)
                     if closed:
                         executor.log_execution(closed.id, execution, slot)
+                        # Clear in-position flag
+                        pair_state = signal_gen.get_pair_states().get(sig.pair_key)
+                        if pair_state:
+                            pair_state.in_position = False
                         print_exit(closed, reason)
 
-            # Mark-to-market all open positions
+            # Mark-to-market all open positions and sync z-scores
             portfolio.mark_to_market(signal_gen.token_prices)
+            for pk, pos in portfolio.positions.items():
+                ps = signal_gen.get_pair_states().get(pk)
+                if ps:
+                    pos.current_zscore = ps.current_zscore
+
+            # Dollar-based stop loss: close positions that lost too much
+            for pair_key in list(portfolio.positions.keys()):
+                pos = portfolio.positions[pair_key]
+                entry_value = pos.entry_value_a + pos.entry_value_b
+                if entry_value > 0 and pos.unrealized_pnl < -entry_value * config.max_position_loss_pct:
+                    price_a = signal_gen.token_prices.get(pos.token_a_mint, pos.current_price_a)
+                    price_b = signal_gen.token_prices.get(pos.token_b_mint, pos.current_price_b)
+                    execution = executor.execute_exit(pos, price_a, price_b)
+                    pos.current_price_a = execution.fill_a.price
+                    pos.current_price_b = execution.fill_b.price
+                    closed = portfolio.close_position(pair_key, 0.0, slot, "dollar_stop")
+                    if closed:
+                        executor.log_execution(closed.id, execution, slot)
+                        pair_state = signal_gen.get_pair_states().get(pair_key)
+                        if pair_state:
+                            pair_state.in_position = False
+                        print_exit(closed, f"dollar_stop (lost >{config.max_position_loss_pct:.0%})")
 
             # Progress display
             stats['blocks'] += 1
             if stats['blocks'] % 10 == 0:
+                num_prices = len(signal_gen.token_prices)
+                active_pairs = sum(1 for p in signal_gen.get_pair_states().values() if p.prices_a.count > 0)
                 print_progress(slot, stats['blocks'], stats['signals'], stats['trades'], start_time)
+            if stats['blocks'] % 100 == 0:
+                # Debug: show price extraction and buffer fill status
+                pairs_with_min = sum(1 for p in signal_gen.get_pair_states().values()
+                                     if p.prices_a.count >= max(10, config.lookback_window // 2))
+                logger.info(f"Prices tracked: {len(signal_gen.token_prices)} tokens | "
+                            f"Active pairs: {active_pairs}/{len(signal_gen.get_pair_states())} | "
+                            f"Pairs with min obs: {pairs_with_min}")
 
             # Periodic z-score dashboard
             now = time.time()

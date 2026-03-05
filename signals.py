@@ -13,7 +13,7 @@ from typing import Dict, List, Optional, Set
 import base58
 import numpy as np
 
-from constants import WELL_KNOWN_TOKENS, QUOTE_PRIORITY
+from constants import WELL_KNOWN_TOKENS, QUOTE_PRIORITY, STABLECOIN_MINTS, SOL_MINT
 from swap_detector import SwapDetector
 
 logger = logging.getLogger(__name__)
@@ -98,6 +98,8 @@ class PairState:
     spread_std: float = 0.0
     last_update_slot: int = 0
     cointegration_analyzed_at: int = 0
+    in_position: bool = False
+    position_entry_slot: int = 0
 
     def init_buffers(self, capacity: int):
         self.prices_a = CircularBuffer(capacity)
@@ -121,11 +123,12 @@ class SignalGenerator:
         self.config = config
         self.scanner_db_path = scanner_db_path
         self.pairs: Dict[str, PairState] = {}
-        self.token_prices: Dict[str, float] = {}
+        self.token_prices: Dict[str, float] = {}  # USD-normalized prices
         self.monitored_mints: Set[str] = set()
         self.swap_detector = SwapDetector()
         self.last_pair_reload = 0
         self.pair_reload_interval = 900  # 15 minutes
+        self.sol_usd_price: float = 0.0  # cached SOL/USD from stablecoin swaps
 
     def load_pairs(self) -> int:
         """Load cointegrated pairs from scanner DB."""
@@ -201,8 +204,16 @@ class SignalGenerator:
         if not new_prices:
             return []
 
-        # Update token prices
-        self.token_prices.update(new_prices)
+        # Update token prices with outlier rejection
+        for mint, new_price in new_prices.items():
+            old_price = self.token_prices.get(mint)
+            if old_price and old_price > 0:
+                change_pct = abs(new_price - old_price) / old_price
+                if change_pct > 0.50:  # Reject >50% price jumps
+                    logger.debug(f"Rejected price outlier for {mint[:8]}.. "
+                                 f"${old_price:.6f} -> ${new_price:.6f} ({change_pct:.0%})")
+                    continue
+            self.token_prices[mint] = new_price
 
         # Update each monitored pair and check for signals
         signals = []
@@ -231,26 +242,37 @@ class SignalGenerator:
         return signals
 
     def _extract_prices_from_block(self, slot: int, block) -> Dict[str, float]:
-        """Extract median implied price per token from all swaps in a block."""
+        """Extract median implied USD price per token from all swaps in a block."""
         if not hasattr(block, 'transactions'):
+            logger.debug(f"Slot {slot}: block has no transactions attr")
             return {}
 
-        # Collect all observed prices per token
-        token_obs: Dict[str, List[float]] = {}
+        # Collect observations: mint -> list of (price, quote_mint)
+        token_obs: Dict[str, List[tuple]] = {}
+
+        tx_count = 0
+        skip_no_tx = 0
+        skip_err = 0
+        swap_count = 0
+        price_count = 0
 
         for tx in block.transactions:
+            tx_count += 1
             if not tx or not hasattr(tx, 'transaction'):
+                skip_no_tx += 1
                 continue
-            if hasattr(tx, 'meta') and tx.meta and tx.meta.err:
+            if hasattr(tx, 'meta') and tx.meta and hasattr(tx.meta.err, 'err') and tx.meta.err.err:
+                skip_err += 1
                 continue
 
             try:
                 swaps = self.swap_detector.analyze_transaction(tx)
-            except Exception:
+            except Exception as e:
                 continue
 
             if not swaps:
                 continue
+            swap_count += len(swaps)
 
             for swap in swaps:
                 vaults = swap.get('vault_balance_changes', {})
@@ -308,14 +330,59 @@ class SignalGenerator:
                 if price <= 0 or not np.isfinite(price):
                     continue
 
-                # Only track tokens we're monitoring
-                if base_mint in self.monitored_mints:
-                    token_obs.setdefault(base_mint, []).append(price)
+                # Track all monitored tokens (and SOL for cross-reference)
+                if base_mint in self.monitored_mints or base_mint == SOL_MINT:
+                    token_obs.setdefault(base_mint, []).append((price, quote_mint))
+                    price_count += 1
 
-        # Take median price per token
+        if slot % 100 == 0:
+            logger.info(f"Slot {slot} price extraction: {tx_count} txs, "
+                        f"{skip_no_tx} no-tx, {skip_err} err, "
+                        f"{swap_count} swaps, {price_count} prices, "
+                        f"{len(token_obs)} tokens | SOL/USD=${self.sol_usd_price:.2f}")
+
+        # Update SOL/USD from SOL's stablecoin-quoted observations (median + outlier rejection)
+        sol_obs = token_obs.get(SOL_MINT, [])
+        sol_usd_candidates = [p for p, q in sol_obs if q in STABLECOIN_MINTS]
+        if sol_usd_candidates:
+            new_sol_usd = float(np.median(sol_usd_candidates))
+            if self.sol_usd_price > 0:
+                change_pct = abs(new_sol_usd - self.sol_usd_price) / self.sol_usd_price
+                if change_pct < 0.20:  # Reject >20% jumps as outliers
+                    self.sol_usd_price = new_sol_usd
+                else:
+                    logger.warning(f"Rejected SOL/USD outlier: ${new_sol_usd:.2f} "
+                                   f"(was ${self.sol_usd_price:.2f}, {change_pct:.0%} change)")
+            else:
+                self.sol_usd_price = new_sol_usd
+
+        # Convert all prices to USD
         result = {}
-        for mint, prices in token_obs.items():
-            result[mint] = float(np.median(prices))
+        for mint, observations in token_obs.items():
+            # Separate stablecoin-quoted and SOL-quoted observations
+            usd_prices = []
+            sol_prices = []
+            for price, quote in observations:
+                if quote in STABLECOIN_MINTS:
+                    usd_prices.append(price)
+                elif quote == SOL_MINT:
+                    sol_prices.append(price)
+
+            if usd_prices:
+                # Prefer stablecoin-quoted prices (already in USD)
+                result[mint] = float(np.median(usd_prices))
+            elif sol_prices and self.sol_usd_price > 0:
+                # Convert SOL-quoted prices to USD
+                median_sol_price = float(np.median(sol_prices))
+                result[mint] = median_sol_price * self.sol_usd_price
+            # else: skip — no way to convert to USD
+
+        # Inject known prices for quote tokens (they're never "base" in swaps)
+        for stablecoin_mint in STABLECOIN_MINTS:
+            if stablecoin_mint in self.monitored_mints:
+                result[stablecoin_mint] = 1.0
+        if SOL_MINT in self.monitored_mints and self.sol_usd_price > 0:
+            result[SOL_MINT] = self.sol_usd_price
 
         return result
 
@@ -384,11 +451,17 @@ class SignalGenerator:
         if abs(z) > self.config.stop_loss_zscore:
             return SignalType.STOP_LOSS
         elif z < -self.config.entry_zscore:
-            return SignalType.ENTRY_LONG
+            if not pair.in_position:
+                return SignalType.ENTRY_LONG
         elif z > self.config.entry_zscore:
-            return SignalType.ENTRY_SHORT
+            if not pair.in_position:
+                return SignalType.ENTRY_SHORT
         elif abs(z) < self.config.exit_zscore:
-            return SignalType.EXIT
+            if pair.in_position:
+                # Enforce cooldown: don't exit too soon after entry
+                slots_since_entry = pair.last_update_slot - pair.position_entry_slot
+                if slots_since_entry >= self.config.entry_cooldown_slots:
+                    return SignalType.EXIT
         return None
 
     def get_pair_states(self) -> Dict[str, PairState]:

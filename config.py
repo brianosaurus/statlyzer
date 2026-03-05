@@ -43,8 +43,9 @@ class Config:
 
     # Risk
     max_drawdown_pct: float = float(os.getenv('MAX_DRAWDOWN_PCT', '0.10'))
+    max_position_loss_pct: float = float(os.getenv('MAX_POSITION_LOSS_PCT', '0.50'))
     pair_staleness_hours: int = int(os.getenv('PAIR_STALENESS_HOURS', '24'))
-    min_half_life: float = float(os.getenv('MIN_HALF_LIFE', '2.0'))
+    min_half_life: float = float(os.getenv('MIN_HALF_LIFE', '1.5'))
     max_half_life_ratio: float = float(os.getenv('MAX_HALF_LIFE_RATIO', '0.5'))
 
     # Execution
@@ -55,5 +56,6 @@ class Config:
 
     # Mode
     paper_trade: bool = os.getenv('PAPER_TRADE', 'true').lower() == 'true'
-    lookback_window: int = int(os.getenv('LOOKBACK_WINDOW', '60'))
+    lookback_window: int = int(os.getenv('LOOKBACK_WINDOW', '500'))
+    entry_cooldown_slots: int = int(os.getenv('ENTRY_COOLDOWN_SLOTS', '300'))
     initial_capital: float = float(os.getenv('INITIAL_CAPITAL', '10000'))
