@@ -25,12 +25,29 @@ class RiskManager:
         self.portfolio = portfolio
         self.entries_this_hour: list = []  # timestamps
         self.kill_switch: bool = False
+        self.kill_switch_time: float = 0  # when kill switch was engaged
+        self.kill_switch_cooldown: float = 600  # 10 minutes
 
     def check_entry(self, signal, pair_state) -> RiskCheck:
         """Run all risk checks before allowing a new entry."""
-        # 1. Kill switch
+        # 1. Kill switch (auto-resets after cooldown if drawdown recovered)
         if self.kill_switch:
-            return RiskCheck(False, "Kill switch engaged")
+            elapsed = time.time() - self.kill_switch_time
+            if elapsed > self.kill_switch_cooldown:
+                dd = self.portfolio.get_drawdown()
+                if dd <= self.config.max_drawdown_pct:
+                    logger.info(f"Kill switch auto-reset after {elapsed:.0f}s cooldown "
+                                f"(drawdown recovered to {dd:.1%})")
+                    self.kill_switch = False
+                else:
+                    return RiskCheck(False, f"Kill switch engaged (dd={dd:.1%}, cooldown {elapsed:.0f}s)")
+            else:
+                return RiskCheck(False, "Kill switch engaged")
+
+        # 1b. Entry z-score cap — don't enter too close to stop loss
+        abs_z = abs(signal.zscore)
+        if abs_z > self.config.max_entry_zscore:
+            return RiskCheck(False, f"|z|={abs_z:.1f} > max entry {self.config.max_entry_zscore}")
 
         # 2. Already in this pair
         if self.portfolio.has_position(signal.pair_key):
@@ -41,10 +58,27 @@ class RiskManager:
         if num_open >= self.config.max_positions:
             return RiskCheck(False, f"Max positions ({self.config.max_positions}) reached")
 
-        # 4. Max exposure
+        # 3b. Concentration limit — max positions sharing a token
+        # Exempt stablecoins (USDC etc.) since they're the quote currency for every pair
+        from constants import STABLECOIN_MINTS
+        mint_a = signal.token_a_mint
+        mint_b = signal.token_b_mint
+        max_per_token = self.config.max_positions_per_token
+        for mint in (mint_a, mint_b):
+            if mint in STABLECOIN_MINTS:
+                continue
+            count = sum(
+                1 for p in self.portfolio.positions.values()
+                if p.token_a_mint == mint or p.token_b_mint == mint
+            )
+            if count >= max_per_token:
+                return RiskCheck(False, f"Concentration limit ({max_per_token}) for {mint[:8]}.. reached")
+
+        # 4. Max exposure (scales with portfolio capital)
         exposure = self.portfolio.get_total_exposure()
-        if exposure >= self.config.max_total_exposure_usd:
-            return RiskCheck(False, f"Max exposure (${self.config.max_total_exposure_usd:.0f}) reached")
+        max_exposure = self.portfolio.initial_capital * self.config.max_exposure_ratio
+        if exposure >= max_exposure:
+            return RiskCheck(False, f"Max exposure (${max_exposure:.0f}) reached")
 
         # 5. Drawdown check
         if self.check_drawdown():
@@ -61,14 +95,11 @@ class RiskManager:
         hl = pair_state.half_life
         if hl < self.config.min_half_life:
             return RiskCheck(False, f"Half-life too short ({hl:.1f} < {self.config.min_half_life})")
-        max_hl = self.config.lookback_window * self.config.max_half_life_ratio
+        # lookback_window is in candles; convert to blocks for half-life comparison
+        lookback_blocks = self.config.lookback_window * self.config.signal_resample_secs / 0.4
+        max_hl = lookback_blocks * self.config.max_half_life_ratio
         if hl > max_hl and hl != float('inf'):
             return RiskCheck(False, f"Half-life too long ({hl:.1f} > {max_hl:.1f})")
-
-        # 8. Rate limit
-        self._prune_entries()
-        if len(self.entries_this_hour) >= self.config.max_positions_per_hour:
-            return RiskCheck(False, f"Rate limit ({self.config.max_positions_per_hour}/hr) reached")
 
         return RiskCheck(True)
 
@@ -85,6 +116,7 @@ class RiskManager:
             if not self.kill_switch:
                 logger.warning(f"KILL SWITCH engaged: drawdown {dd:.1%} > {self.config.max_drawdown_pct:.1%}")
                 self.kill_switch = True
+                self.kill_switch_time = time.time()
             return True
         return False
 

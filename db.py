@@ -105,6 +105,24 @@ class Database:
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
 
+            CREATE TABLE IF NOT EXISTS discovered_pairs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                pair_key TEXT NOT NULL UNIQUE,
+                token_a_mint TEXT NOT NULL,
+                token_b_mint TEXT NOT NULL,
+                token_a_symbol TEXT NOT NULL,
+                token_b_symbol TEXT NOT NULL,
+                hedge_ratio REAL NOT NULL,
+                half_life REAL NOT NULL,
+                eg_p_value REAL NOT NULL,
+                eg_test_statistic REAL NOT NULL,
+                spread_mean REAL NOT NULL,
+                spread_std REAL NOT NULL,
+                num_observations INTEGER NOT NULL,
+                analyzed_at REAL NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+
             CREATE INDEX IF NOT EXISTS idx_signals_pair ON signals(pair_key);
             CREATE INDEX IF NOT EXISTS idx_signals_time ON signals(timestamp);
             CREATE INDEX IF NOT EXISTS idx_positions_status ON positions(status);
@@ -277,6 +295,61 @@ class Database:
             return []
         finally:
             conn.close()
+
+    # --- Discovered pairs persistence ---
+
+    def save_discovered_pair(self, result) -> None:
+        """UPSERT a discovered cointegration result."""
+        from signals import make_pair_key
+        pair_key = make_pair_key(result.token_a_mint, result.token_b_mint)
+        self.conn.execute("""
+            INSERT INTO discovered_pairs
+                (pair_key, token_a_mint, token_b_mint, token_a_symbol, token_b_symbol,
+                 hedge_ratio, half_life, eg_p_value, eg_test_statistic,
+                 spread_mean, spread_std, num_observations, analyzed_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(pair_key) DO UPDATE SET
+                hedge_ratio=excluded.hedge_ratio, half_life=excluded.half_life,
+                eg_p_value=excluded.eg_p_value, eg_test_statistic=excluded.eg_test_statistic,
+                spread_mean=excluded.spread_mean, spread_std=excluded.spread_std,
+                num_observations=excluded.num_observations, analyzed_at=excluded.analyzed_at
+        """, (pair_key, result.token_a_mint, result.token_b_mint,
+              result.token_a_symbol, result.token_b_symbol,
+              result.hedge_ratio, result.half_life, result.eg_p_value,
+              result.eg_test_statistic, result.spread_mean, result.spread_std,
+              result.num_observations, result.analyzed_at))
+        self.conn.commit()
+
+    def load_discovered_pairs(self) -> List[Dict]:
+        """Load all discovered pairs from DB (for crash recovery)."""
+        rows = self.conn.execute("""
+            SELECT pair_key, token_a_mint, token_b_mint, token_a_symbol, token_b_symbol,
+                   hedge_ratio, half_life, eg_p_value, eg_test_statistic,
+                   spread_mean, spread_std, num_observations, analyzed_at
+            FROM discovered_pairs
+        """).fetchall()
+        pairs = []
+        for row in rows:
+            pairs.append({
+                'pair_key': row[0],
+                'token_a_mint': row[1],
+                'token_b_mint': row[2],
+                'token_a_symbol': row[3],
+                'token_b_symbol': row[4],
+                'hedge_ratio': row[5],
+                'half_life': row[6],
+                'eg_p_value': row[7],
+                'eg_test_statistic': row[8],
+                'spread_mean': row[9],
+                'spread_std': row[10],
+                'num_observations': row[11],
+                'analyzed_at': row[12],
+            })
+        return pairs
+
+    def remove_discovered_pair(self, pair_key: str) -> None:
+        self.conn.execute("DELETE FROM discovered_pairs WHERE pair_key = ?", (pair_key,))
+        self.conn.commit()
 
     def get_stats(self) -> dict:
         total = self.conn.execute("SELECT COUNT(*) FROM positions").fetchone()[0]

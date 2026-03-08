@@ -32,30 +32,47 @@ class Config:
     entry_zscore: float = float(os.getenv('ENTRY_ZSCORE', '2.5'))
     exit_zscore: float = float(os.getenv('EXIT_ZSCORE', '0.5'))
     stop_loss_zscore: float = float(os.getenv('STOP_LOSS_ZSCORE', '5.0'))
+    max_entry_zscore: float = float(os.getenv('MAX_ENTRY_ZSCORE', '5.0'))
 
     # Position sizing
     sizing_method: str = os.getenv('SIZING_METHOD', 'fixed_fraction')
-    fixed_fraction: float = float(os.getenv('FIXED_FRACTION', '0.02'))
+    fixed_fraction: float = float(os.getenv('FIXED_FRACTION', '0.05'))
     max_position_usd: float = float(os.getenv('MAX_POSITION_USD', '1000'))
-    max_total_exposure_usd: float = float(os.getenv('MAX_TOTAL_EXPOSURE_USD', '5000'))
+    max_exposure_ratio: float = float(os.getenv('MAX_EXPOSURE_RATIO', '1.0'))
     max_positions: int = int(os.getenv('MAX_POSITIONS', '10'))
     max_positions_per_hour: int = int(os.getenv('MAX_POSITIONS_PER_HOUR', '5'))
 
     # Risk
     max_drawdown_pct: float = float(os.getenv('MAX_DRAWDOWN_PCT', '0.10'))
-    max_position_loss_pct: float = float(os.getenv('MAX_POSITION_LOSS_PCT', '0.50'))
+    max_position_loss_pct: float = float(os.getenv('MAX_POSITION_LOSS_PCT', '0.15'))
+    max_position_age_half_lives: float = float(os.getenv('MAX_POSITION_AGE_HALF_LIVES', '5.0'))
     pair_staleness_hours: int = int(os.getenv('PAIR_STALENESS_HOURS', '24'))
-    min_half_life: float = float(os.getenv('MIN_HALF_LIFE', '1.5'))
+    min_half_life: float = float(os.getenv('MIN_HALF_LIFE', '200'))
     max_half_life_ratio: float = float(os.getenv('MAX_HALF_LIFE_RATIO', '0.5'))
+    max_positions_per_token: int = int(os.getenv('MAX_POSITIONS_PER_TOKEN', '5'))
 
     # Execution
     slippage_bps: int = int(os.getenv('SLIPPAGE_BPS', '50'))
     priority_fee_lamports: int = int(os.getenv('PRIORITY_FEE', '10000'))
     use_jito: bool = os.getenv('USE_JITO', 'false').lower() == 'true'
     jito_tip_lamports: int = int(os.getenv('JITO_TIP', '10000'))
+    jito_block_engine: str = os.getenv('JITO_BLOCK_ENGINE', 'https://frankfurt.mainnet.block-engine.jito.wtf')
+
+    # Price feed
+    price_poll_interval: float = float(os.getenv('PRICE_POLL_INTERVAL', '30'))
 
     # Mode
     paper_trade: bool = os.getenv('PAPER_TRADE', 'true').lower() == 'true'
-    lookback_window: int = int(os.getenv('LOOKBACK_WINDOW', '2500'))
+    lookback_window: int = int(os.getenv('LOOKBACK_WINDOW', '100'))
+    signal_resample_secs: float = float(os.getenv('SIGNAL_RESAMPLE_SECS', '300'))  # 5-min candles
     entry_cooldown_slots: int = int(os.getenv('ENTRY_COOLDOWN_SLOTS', '750'))
-    initial_capital: float = float(os.getenv('INITIAL_CAPITAL', '10000'))
+    initial_capital: float = float(os.getenv('INITIAL_CAPITAL', '1000'))
+
+    # Inline cointegration discovery
+    coint_scan_interval: float = float(os.getenv('COINT_SCAN_INTERVAL', '300'))
+    coint_resample_secs: float = float(os.getenv('COINT_RESAMPLE_SECS', '30'))
+    coint_min_observations: int = int(os.getenv('COINT_MIN_OBSERVATIONS', '50'))
+    coint_p_threshold: float = float(os.getenv('COINT_P_THRESHOLD', '0.05'))
+    coint_history_capacity: int = int(os.getenv('COINT_HISTORY_CAPACITY', '10000'))
+    coint_warmup_minutes: float = float(os.getenv('COINT_WARMUP_MINUTES', '30'))
+    use_scanner_db: bool = os.getenv('USE_SCANNER_DB', 'true').lower() == 'true'

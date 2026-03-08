@@ -63,18 +63,21 @@ class PositionSizer:
         if dollar_size <= 0:
             return None
 
-        # Check against max position
-        dollar_size = min(dollar_size, self.config.max_position_usd)
+        # Hedge ratio determines leg B size relative to leg A
+        hedge = abs(signal.hedge_ratio) if signal.hedge_ratio != 0 else 1.0
 
-        # Check against remaining exposure budget
-        remaining_budget = self.config.max_total_exposure_usd - current_exposure
+        # Cap total exposure (both legs) at max_position_usd
+        max_leg_a = self.config.max_position_usd / (1.0 + hedge)
+        dollar_size = min(dollar_size, max_leg_a)
+
+        # Check against remaining exposure budget (scales with portfolio value)
+        max_exposure = portfolio_value * self.config.max_exposure_ratio
+        remaining_budget = max_exposure - current_exposure
         if remaining_budget <= 0:
             return None
-        dollar_size = min(dollar_size, remaining_budget / 2)  # /2 because it's two legs
+        dollar_size = min(dollar_size, remaining_budget / (1.0 + hedge))
 
         # Compute token quantities
-        # Leg A gets dollar_size, leg B gets dollar_size * |hedge_ratio|
-        hedge = abs(signal.hedge_ratio) if signal.hedge_ratio != 0 else 1.0
         dollar_a = dollar_size
         dollar_b = dollar_size * hedge
 

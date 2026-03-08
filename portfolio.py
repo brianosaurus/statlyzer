@@ -60,6 +60,7 @@ class Position:
     status: PositionStatus = PositionStatus.OPEN
     is_paper: bool = True
     id: Optional[int] = None
+    fees_usd: float = 0.0  # accumulated transaction fees (entry + exit)
 
 
 class PortfolioManager:
@@ -85,6 +86,9 @@ class PortfolioManager:
         saved_peak = self.db.get_state('peak_value')
         if saved_peak:
             self.peak_value = float(saved_peak)
+        else:
+            # No saved peak — set to current capital (not config default)
+            self.peak_value = self.initial_capital
 
         saved_pnl = self.db.get_state('total_realized_pnl')
         if saved_pnl:
@@ -123,7 +127,8 @@ class PortfolioManager:
             logger.info(f"Recovered {len(self.positions)} open positions from DB")
 
     def open_position(self, signal, size, is_paper: bool = True,
-                      price_a: float = 0.0, price_b: float = 0.0) -> Position:
+                      price_a: float = 0.0, price_b: float = 0.0,
+                      fees_usd: float = 0.0) -> Position:
         """Create a new position from a signal and size."""
         direction = "long" if signal.signal_type.value == "entry_long" else "short"
 
@@ -148,6 +153,7 @@ class PortfolioManager:
         )
         position.current_price_a = position.entry_price_a
         position.current_price_b = position.entry_price_b
+        position.fees_usd = fees_usd
 
         # Persist immediately
         self.db.save_position(position)
@@ -159,7 +165,8 @@ class PortfolioManager:
         return position
 
     def close_position(self, pair_key: str, exit_zscore: float,
-                       exit_slot: int, reason: str) -> Optional[Position]:
+                       exit_slot: int, reason: str,
+                       exit_fees_usd: float = 0.0) -> Optional[Position]:
         """Close an existing position and compute realized P&L."""
         position = self.positions.get(pair_key)
         if not position:
@@ -182,11 +189,32 @@ class PortfolioManager:
             pnl_b = (position.current_price_b - position.entry_price_b) * position.quantity_b
 
         position.realized_pnl = pnl_a + pnl_b
+
+        # Deduct transaction fees (entry fees already stored, add exit fees)
+        position.fees_usd += exit_fees_usd
+        position.realized_pnl -= position.fees_usd
+
+        # Sanity cap: a pair trade can't lose more than its total entry value
+        entry_value = position.entry_value_a + position.entry_value_b
+        if entry_value > 0 and position.realized_pnl < -entry_value:
+            logger.warning(f"P&L ${position.realized_pnl:+.2f} exceeds entry value ${entry_value:.2f} — "
+                           f"capping to -${entry_value:.2f} (price data error)")
+            position.realized_pnl = -entry_value
+
         position.status = PositionStatus.STOPPED_OUT if reason == "stop_loss" else PositionStatus.CLOSED
 
         # Update totals
         self.total_realized_pnl += position.realized_pnl
         self.db.set_state('total_realized_pnl', str(self.total_realized_pnl))
+
+        # Compound reinvest: fold all realized P&L into capital base
+        # (total_realized_pnl is kept for reporting only; get_total_value uses initial_capital)
+        self.initial_capital += position.realized_pnl
+        self.db.set_state('initial_capital', str(self.initial_capital))
+        if position.realized_pnl >= 0:
+            logger.info(f"Compounded +${position.realized_pnl:.2f} → capital now ${self.initial_capital:.2f}")
+        else:
+            logger.info(f"Compounded ${position.realized_pnl:.2f} → capital now ${self.initial_capital:.2f}")
 
         # Persist
         self.db.update_position(position)
@@ -194,7 +222,8 @@ class PortfolioManager:
         self.closed_positions.append(position)
 
         logger.info(f"Closed {position.direction} {pair_key} ({reason}): "
-                     f"P&L ${position.realized_pnl:+.2f}")
+                     f"P&L ${position.realized_pnl:+.2f}"
+                     f"{f' (fees: ${position.fees_usd:.4f})' if position.fees_usd > 0 else ''}")
         return position
 
     def mark_to_market(self, prices: Dict[str, float]):
@@ -235,7 +264,8 @@ class PortfolioManager:
         return sum(p.unrealized_pnl for p in self.positions.values())
 
     def get_total_value(self) -> float:
-        return self.initial_capital + self.total_realized_pnl + self.get_total_unrealized_pnl()
+        # initial_capital includes all compounded realized P&L
+        return self.initial_capital + self.get_total_unrealized_pnl()
 
     def get_drawdown(self) -> float:
         if self.peak_value <= 0:
@@ -258,5 +288,10 @@ class PortfolioManager:
         )
 
     def save_capital(self):
-        """Persist initial capital to DB."""
+        """Persist initial capital to DB and ensure peak_value is consistent."""
         self.db.set_state('initial_capital', str(self.initial_capital))
+        # If peak is below current capital (e.g. --capital override), reset it
+        current_value = self.get_total_value()
+        if current_value > self.peak_value:
+            self.peak_value = current_value
+            self.db.set_state('peak_value', str(self.peak_value))
