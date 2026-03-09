@@ -123,11 +123,20 @@ class Database:
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
 
+            CREATE TABLE IF NOT EXISTS price_candles (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                pair_key TEXT NOT NULL,
+                timestamp REAL NOT NULL,
+                log_price_a REAL NOT NULL,
+                log_price_b REAL NOT NULL
+            );
+
             CREATE INDEX IF NOT EXISTS idx_signals_pair ON signals(pair_key);
             CREATE INDEX IF NOT EXISTS idx_signals_time ON signals(timestamp);
             CREATE INDEX IF NOT EXISTS idx_positions_status ON positions(status);
             CREATE INDEX IF NOT EXISTS idx_positions_pair ON positions(pair_key);
             CREATE INDEX IF NOT EXISTS idx_exec_position ON execution_log(position_id);
+            CREATE INDEX IF NOT EXISTS idx_candles_pair_time ON price_candles(pair_key, timestamp);
         """)
         self.conn.commit()
 
@@ -349,6 +358,34 @@ class Database:
 
     def remove_discovered_pair(self, pair_key: str) -> None:
         self.conn.execute("DELETE FROM discovered_pairs WHERE pair_key = ?", (pair_key,))
+        self.conn.commit()
+
+    # --- Price candle persistence (warmup avoidance) ---
+
+    def save_candle(self, pair_key: str, timestamp: float,
+                    log_price_a: float, log_price_b: float) -> None:
+        self.conn.execute(
+            "INSERT INTO price_candles (pair_key, timestamp, log_price_a, log_price_b) "
+            "VALUES (?, ?, ?, ?)",
+            (pair_key, timestamp, log_price_a, log_price_b),
+        )
+        self.conn.commit()
+
+    def load_candles(self, pair_key: str, limit: int = 100) -> List[tuple]:
+        """Load most recent candles for a pair, ordered oldest-first."""
+        return self.conn.execute(
+            "SELECT timestamp, log_price_a, log_price_b FROM price_candles "
+            "WHERE pair_key = ? ORDER BY timestamp DESC LIMIT ?",
+            (pair_key, limit),
+        ).fetchall()[::-1]  # reverse to oldest-first
+
+    def trim_candles(self, pair_key: str, keep: int = 100) -> None:
+        """Delete old candles beyond the keep limit."""
+        self.conn.execute(
+            "DELETE FROM price_candles WHERE pair_key = ? AND id NOT IN "
+            "(SELECT id FROM price_candles WHERE pair_key = ? ORDER BY timestamp DESC LIMIT ?)",
+            (pair_key, pair_key, keep),
+        )
         self.conn.commit()
 
     def get_stats(self) -> dict:

@@ -89,10 +89,6 @@ class PairState:
     prices_a: CircularBuffer = field(default=None, repr=False)
     prices_b: CircularBuffer = field(default=None, repr=False)
 
-    # Spread statistics from scanner DB (historically calibrated)
-    scanner_spread_mean: float = 0.0
-    scanner_spread_std: float = 0.0
-
     # Cached z-score
     current_zscore: float = 0.0
     current_spread: float = 0.0
@@ -126,15 +122,17 @@ def token_symbol(mint: str) -> str:
 class SignalGenerator:
     """Monitors cointegrated pairs and generates trading signals."""
 
-    def __init__(self, config, scanner_db_path: str = None):
+    def __init__(self, config, scanner_db_path: str = None, db=None):
         self.config = config
         self.scanner_db_path = scanner_db_path
+        self.db = db  # For candle persistence
         self.pairs: Dict[str, PairState] = {}
         self.token_prices: Dict[str, float] = {}  # USD-normalized prices
         self.monitored_mints: Set[str] = set()
         self.last_pair_reload = 0
         self.pair_reload_interval = 900  # 15 minutes
         self.sol_usd_price: float = 0.0  # cached SOL/USD
+        self._candle_save_count = 0  # batch commit counter
 
         # Inline cointegration discovery
         from cointegration import CointegrationDiscovery
@@ -206,8 +204,6 @@ class SignalGenerator:
                 self.pairs[pair_key].hedge_ratio = p['hedge_ratio']
                 self.pairs[pair_key].half_life = hl
                 self.pairs[pair_key].cointegration_analyzed_at = analyzed_at
-                self.pairs[pair_key].scanner_spread_mean = p.get('spread_mean', 0.0)
-                self.pairs[pair_key].scanner_spread_std = p.get('spread_std', 0.0)
             else:
                 state = PairState(
                     pair_key=pair_key,
@@ -219,10 +215,9 @@ class SignalGenerator:
                     half_life=hl,
                     eg_p_value=p.get('eg_p_value', 1.0),
                     cointegration_analyzed_at=analyzed_at,
-                    scanner_spread_mean=p.get('spread_mean', 0.0),
-                    scanner_spread_std=p.get('spread_std', 0.0),
                 )
                 state.init_buffers(self.config.lookback_window)
+                self._restore_candles(state)
                 self.pairs[pair_key] = state
 
             self.monitored_mints.add(mint_a)
@@ -274,6 +269,7 @@ class SignalGenerator:
                     cointegration_analyzed_at=int(r.analyzed_at),
                 )
                 state.init_buffers(self.config.lookback_window)
+                self._restore_candles(state)
                 self.pairs[pair_key] = state
                 logger.info(f"Discovered pair: {r.token_a_symbol}/{r.token_b_symbol} "
                             f"p={r.eg_p_value:.4f} hl={hl_blocks:.0f}blk hr={r.hedge_ratio:.4f}")
@@ -356,6 +352,21 @@ class SignalGenerator:
         mints.add(SOL_MINT)
         return mints
 
+    def _restore_candles(self, pair: PairState):
+        """Restore saved candles from DB into the pair's circular buffers."""
+        if not self.db:
+            return
+        candles = self.db.load_candles(pair.pair_key, self.config.lookback_window)
+        if not candles:
+            return
+        for ts, log_a, log_b in candles:
+            pair.prices_a.append(log_a)
+            pair.prices_b.append(log_b)
+        # Set last_resample_time so the next candle flushes at the right time
+        pair.last_resample_time = candles[-1][0]
+        logger.info(f"Restored {len(candles)} candles for {pair.pair_key[:8]}..{pair.pair_key[-6:]} "
+                    f"(count={pair.prices_a.count})")
+
     def _update_pair(self, pair: PairState, price_a: float, price_b: float,
                      slot: int, block_time: int) -> Optional[Signal]:
         """Update pair with resampled candle-close prices.
@@ -396,24 +407,22 @@ class SignalGenerator:
         pair.prices_b.append(log_b)
         pair.last_resample_time = now
 
-        # Need minimum observations (Jupiter prices are clean, 10 candles suffices)
-        if pair.prices_a.count < 10:
+        # Persist candle to DB for warmup avoidance on restart
+        if self.db:
+            self.db.save_candle(pair.pair_key, now, float(log_a), float(log_b))
+
+        # Need minimum observations for meaningful statistics
+        if pair.prices_a.count < 30:
             return None
 
-        # Compute current spread from resampled buffer
+        # Compute spread and z-score from resampled buffer
         arr_a = pair.prices_a.get_array()
         arr_b = pair.prices_b.get_array()
         spread = arr_a - pair.hedge_ratio * arr_b
-        pair.current_spread = float(spread[-1])
 
-        # Use scanner DB's calibrated spread stats if available,
-        # fall back to buffer stats only if scanner values are missing
-        if pair.scanner_spread_std > 1e-12:
-            pair.spread_mean = pair.scanner_spread_mean
-            pair.spread_std = pair.scanner_spread_std
-        else:
-            pair.spread_mean = float(np.mean(spread))
-            pair.spread_std = float(np.std(spread))
+        pair.current_spread = float(spread[-1])
+        pair.spread_mean = float(np.mean(spread))
+        pair.spread_std = float(np.std(spread))
 
         if pair.spread_std < 1e-12:
             pair.current_zscore = 0.0
@@ -452,20 +461,15 @@ class SignalGenerator:
         Does NOT trigger signals — just updates the dashboard display."""
         if pair.pending_price_a <= 0 or pair.pending_price_b <= 0:
             return
-        # Use scanner DB's calibrated spread stats if available
-        if pair.scanner_spread_std > 1e-12:
-            mean = pair.scanner_spread_mean
-            std = pair.scanner_spread_std
-        else:
-            arr_a = pair.prices_a.get_array()
-            arr_b = pair.prices_b.get_array()
-            if len(arr_a) < 2:
-                return
-            spread = arr_a - pair.hedge_ratio * arr_b
-            mean = float(np.mean(spread))
-            std = float(np.std(spread))
-            if std < 1e-12:
-                return
+        arr_a = pair.prices_a.get_array()
+        arr_b = pair.prices_b.get_array()
+        if len(arr_a) < 2:
+            return
+        spread = arr_a - pair.hedge_ratio * arr_b
+        mean = float(np.mean(spread))
+        std = float(np.std(spread))
+        if std < 1e-12:
+            return
         # Current spread using pending (live) prices
         live_spread = np.log(pair.pending_price_a) - pair.hedge_ratio * np.log(pair.pending_price_b)
         z = (live_spread - mean) / std

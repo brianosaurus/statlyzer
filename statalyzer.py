@@ -127,7 +127,7 @@ async def run_monitor(config: Config, args):
     # Initialize components
     db = Database(args.db)
     scanner_path = config.scanner_db_path if config.use_scanner_db else None
-    signal_gen = SignalGenerator(config, scanner_path)
+    signal_gen = SignalGenerator(config, scanner_path, db=db)
     portfolio = PortfolioManager(config, db)
     risk_mgr = RiskManager(config, portfolio)
     sizer = PositionSizer(config)
