@@ -13,6 +13,7 @@ Usage:
 
 import argparse
 import asyncio
+import json
 import logging
 import sys
 import time
@@ -66,6 +67,20 @@ def parse_args():
                         help='Run for this many minutes then stop')
     parser.add_argument('--no-scanner', action='store_true',
                         help='Disable scanner DB, use inline cointegration discovery only')
+    parser.add_argument('--max-per-token', type=int, default=None,
+                        help='Max positions per token (concentration limit)')
+    parser.add_argument('--max-exposure', type=float, default=None,
+                        help='Max exposure ratio (e.g. 2.0 = 200%% of capital)')
+    parser.add_argument('--fixed-fraction', type=float, default=None,
+                        help='Fixed fraction sizing (e.g. 0.05 = 5%%)')
+    parser.add_argument('--max-position-usd', type=float, default=None,
+                        help='Max USD per position')
+    parser.add_argument('--sizing', type=str, default=None, choices=['fixed_fraction', 'kelly'],
+                        help='Sizing method: fixed_fraction or kelly')
+    parser.add_argument('--max-entry-z', type=float, default=None,
+                        help='Max entry z-score (reject entries above this)')
+    parser.add_argument('--direction', type=str, default=None, choices=['both', 'long', 'short'],
+                        help='Allowed trade direction: both, long, or short')
     parser.add_argument('--verbose', action='store_true',
                         help='Enable debug logging')
     return parser.parse_args()
@@ -87,6 +102,20 @@ def apply_overrides(config: Config, args):
         config.max_positions = args.max_positions
     if args.no_scanner:
         config.use_scanner_db = False
+    if args.max_per_token is not None:
+        config.max_positions_per_token = args.max_per_token
+    if args.max_exposure is not None:
+        config.max_exposure_ratio = args.max_exposure
+    if args.fixed_fraction is not None:
+        config.fixed_fraction = args.fixed_fraction
+    if args.max_position_usd is not None:
+        config.max_position_usd = args.max_position_usd
+    if args.sizing is not None:
+        config.sizing_method = args.sizing
+    if args.max_entry_z is not None:
+        config.max_entry_zscore = args.max_entry_z
+    if args.direction is not None:
+        config.allowed_direction = args.direction
     if args.live and args.confirm_live:
         config.paper_trade = False
 
@@ -110,13 +139,15 @@ def show_status(config: Config, db_path: str):
     if rows:
         columns = db.get_position_columns()
         print(f"\n  Open Positions:")
-        print(f"  {'Pair':<20} {'Dir':<6} {'Entry Z':>8} {'Entry $A':>10} {'Entry $B':>10}")
-        print(f"  {'-'*20} {'-'*6} {'-'*8} {'-'*10} {'-'*10}")
+        print(f"  {'Basket':<24} {'Dir':<6} {'Entry Z':>8} {'Exposure':>10}")
+        print(f"  {'-'*24} {'-'*6} {'-'*8} {'-'*10}")
         for row in rows:
             data = dict(zip(columns, row))
             pair_short = data['pair_key'][:8] + '..' + data['pair_key'][-6:]
-            print(f"  {pair_short:<20} {data['direction']:<6} {data['entry_zscore']:>+8.3f} "
-                  f"{data['entry_value_a']:>10.2f} {data['entry_value_b']:>10.2f}")
+            entry_values = json.loads(data['entry_values_json'])
+            total_exposure = sum(entry_values)
+            print(f"  {pair_short:<24} {data['direction']:<6} {data['entry_zscore']:>+8.3f} "
+                  f"{total_exposure:>10.2f}")
 
     print(f"{'=' * 72}")
     db.close()
@@ -142,14 +173,13 @@ async def run_monitor(config: Config, args):
         executor = LiveExecutor(config, db)
         mode = "LIVE TRADING"
 
-    # Load cointegrated pairs
-    num_pairs = signal_gen.load_pairs()
+    # Load cointegrated baskets
+    num_pairs = signal_gen.load_baskets()
 
     # Try loading cached discovered pairs from DB
     if num_pairs == 0:
         cached = db.load_discovered_pairs()
         if cached:
-            # Add eg_is_cointegrated flag (all saved pairs were cointegrated)
             for d in cached:
                 d['eg_is_cointegrated'] = True
             loaded = signal_gen.load_discovered_pairs(
@@ -159,13 +189,36 @@ async def run_monitor(config: Config, args):
             print(f"  Loaded {loaded} cached discovered pairs from DB")
 
     if num_pairs == 0:
-        print("  No pairs yet — waiting for inline discovery (warmup ~60 min)...")
+        print("  No baskets yet — waiting for inline discovery (warmup ~60 min)...")
 
-    # Sync position state: mark pairs that have open positions
+    # Sync position state: mark baskets that have open positions
     for pair_key in portfolio.positions:
-        pair_state = signal_gen.get_pair_states().get(pair_key)
-        if pair_state:
-            pair_state.in_position = True
+        basket_state = signal_gen.get_basket_states().get(pair_key)
+        if basket_state:
+            basket_state.in_position = True
+
+    # Force-close positions that don't match the allowed direction
+    if config.allowed_direction in ('long', 'short'):
+        unwanted = 'long' if config.allowed_direction == 'short' else 'short'
+        to_close = [pk for pk, pos in portfolio.positions.items()
+                    if pos.direction == unwanted]
+        if to_close:
+            print(f"  Closing {len(to_close)} {unwanted} positions (direction filter)...")
+            for pair_key in to_close:
+                pos = portfolio.positions[pair_key]
+                # Use entry prices as fallback (no live prices yet)
+                exit_prices = list(pos.entry_prices)
+                execution = executor.execute_exit(pos, exit_prices)
+                for i, fill in enumerate(execution.fills):
+                    pos.current_prices[i] = fill.price
+                closed = portfolio.close_position(pair_key, 0.0, 0, "direction_filter",
+                                                  exit_fees_usd=execution.estimated_fees_usd)
+                if closed:
+                    executor.log_execution(closed.id, execution, 0)
+                    basket_state = signal_gen.get_basket_states().get(pair_key)
+                    if basket_state:
+                        basket_state.in_position = False
+                    print(f"    Closed {unwanted} {pair_key[:16]}.. P&L: ${closed.realized_pnl:+.2f}")
 
     # Persist initial capital
     portfolio.save_capital()
@@ -200,19 +253,27 @@ async def run_monitor(config: Config, args):
             if hasattr(executor, 'sol_usd_price') and signal_gen.sol_usd_price > 0:
                 executor.sol_usd_price = signal_gen.sol_usd_price
 
-            # Update price feed mints if discovery added new pairs
+            # Update price feed mints if discovery added new baskets
             feed.update_mints(signal_gen.all_mints())
 
             for sig in signals:
                 stats['signals'] += 1
 
                 if sig.signal_type in (SignalType.ENTRY_LONG, SignalType.ENTRY_SHORT):
-                    # Entry signal
-                    pair_state = signal_gen.get_pair_states().get(sig.pair_key)
-                    if not pair_state:
+                    # Direction filter
+                    if config.allowed_direction == 'short' and sig.signal_type == SignalType.ENTRY_LONG:
+                        db.save_signal(sig, acted_on=False, reason="Direction filter: shorts only")
+                        continue
+                    if config.allowed_direction == 'long' and sig.signal_type == SignalType.ENTRY_SHORT:
+                        db.save_signal(sig, acted_on=False, reason="Direction filter: longs only")
                         continue
 
-                    risk_check = risk_mgr.check_entry(sig, pair_state)
+                    # Entry signal
+                    basket_state = signal_gen.get_basket_states().get(sig.pair_key)
+                    if not basket_state:
+                        continue
+
+                    risk_check = risk_mgr.check_entry(sig, basket_state)
                     if risk_check.allowed or not risk_check.reason.startswith(("Max positions", "Max exposure")):
                         print_signal(sig, risk_check)
                     db.save_signal(sig, acted_on=risk_check.allowed, reason=risk_check.reason)
@@ -220,27 +281,29 @@ async def run_monitor(config: Config, args):
                     if not risk_check.allowed:
                         continue
 
-                    # Get current prices
-                    price_a = signal_gen.token_prices.get(sig.token_a_mint, 0)
-                    price_b = signal_gen.token_prices.get(sig.token_b_mint, 0)
-                    if price_a <= 0 or price_b <= 0:
+                    # Get current prices for all mints in basket
+                    entry_prices = [signal_gen.token_prices.get(m, 0) for m in sig.mints]
+                    if any(p <= 0 for p in entry_prices):
                         continue
 
                     # Size the position
                     exposure = portfolio.get_total_exposure()
                     portfolio_value = portfolio.get_total_value()
-                    size = sizer.compute_size(sig, portfolio_value, exposure, price_a, price_b)
+                    size = sizer.compute_size(sig, portfolio_value, exposure, entry_prices)
                     if size is None:
                         continue
 
                     # Execute
-                    execution = executor.execute_entry(sig, size, price_a, price_b)
+                    execution = executor.execute_entry(sig, size, entry_prices)
                     if execution is None:
                         continue
 
+                    # Fill prices from execution
+                    fill_prices = [f.price for f in execution.fills]
+
                     position = portfolio.open_position(
                         sig, size, is_paper=config.paper_trade,
-                        price_a=execution.fill_a.price, price_b=execution.fill_b.price,
+                        prices=fill_prices,
                         fees_usd=execution.estimated_fees_usd,
                     )
 
@@ -248,8 +311,8 @@ async def run_monitor(config: Config, args):
                     risk_mgr.record_entry()
                     stats['trades'] += 1
 
-                    pair_state.in_position = True
-                    pair_state.position_entry_time = time.time()
+                    basket_state.in_position = True
+                    basket_state.position_entry_time = time.time()
 
                     print_entry(sig, position, execution)
 
@@ -264,47 +327,63 @@ async def run_monitor(config: Config, args):
                         continue
 
                     position = portfolio.positions[sig.pair_key]
-                    price_a = signal_gen.token_prices.get(sig.token_a_mint, position.current_price_a)
-                    price_b = signal_gen.token_prices.get(sig.token_b_mint, position.current_price_b)
 
-                    execution = executor.execute_exit(position, price_a, price_b)
-                    position.current_price_a = execution.fill_a.price
-                    position.current_price_b = execution.fill_b.price
+                    # Min P&L filter: don't exit mean-reversion at a loss unless
+                    # z has fully crossed zero (strong reversion) or stop loss
+                    if sig.signal_type == SignalType.EXIT and position.unrealized_pnl < 0:
+                        # Allow exit if z crossed zero (overshot mean), block if
+                        # z is just drifting near the exit band with negative P&L
+                        z = sig.zscore
+                        crossed_zero = (position.direction == "long" and z > 0) or \
+                                       (position.direction == "short" and z < 0)
+                        if not crossed_zero:
+                            logger.debug(f"Skipping exit {sig.pair_key[:16]}.. — "
+                                         f"unrealized ${position.unrealized_pnl:+.2f}, "
+                                         f"z={z:+.2f}, waiting for better reversion")
+                            continue
+
+                    exit_prices = [signal_gen.token_prices.get(m, position.current_prices[i])
+                                   for i, m in enumerate(position.mints)]
+
+                    execution = executor.execute_exit(position, exit_prices)
+                    # Update current prices from fills
+                    for i, fill in enumerate(execution.fills):
+                        position.current_prices[i] = fill.price
 
                     reason = "stop_loss" if sig.signal_type == SignalType.STOP_LOSS else "mean_reversion"
                     closed = portfolio.close_position(sig.pair_key, sig.zscore, 0, reason,
                                                       exit_fees_usd=execution.estimated_fees_usd)
                     if closed:
                         executor.log_execution(closed.id, execution, 0)
-                        pair_state = signal_gen.get_pair_states().get(sig.pair_key)
-                        if pair_state:
-                            pair_state.in_position = False
+                        basket_state = signal_gen.get_basket_states().get(sig.pair_key)
+                        if basket_state:
+                            basket_state.in_position = False
                         print_exit(closed, reason)
 
             # Mark-to-market using Jupiter prices directly
             portfolio.mark_to_market(signal_gen.token_prices)
             for pk, pos in portfolio.positions.items():
-                ps = signal_gen.get_pair_states().get(pk)
-                if ps:
-                    pos.current_zscore = ps.current_zscore
+                bs = signal_gen.get_basket_states().get(pk)
+                if bs:
+                    pos.current_zscore = bs.current_zscore
 
             # Dollar-based stop loss
             for pair_key in list(portfolio.positions.keys()):
                 pos = portfolio.positions[pair_key]
-                entry_value = pos.entry_value_a + pos.entry_value_b
+                entry_value = sum(pos.entry_values)
                 if entry_value > 0 and pos.unrealized_pnl < -entry_value * config.max_position_loss_pct:
-                    price_a = signal_gen.token_prices.get(pos.token_a_mint, pos.current_price_a)
-                    price_b = signal_gen.token_prices.get(pos.token_b_mint, pos.current_price_b)
-                    execution = executor.execute_exit(pos, price_a, price_b)
-                    pos.current_price_a = execution.fill_a.price
-                    pos.current_price_b = execution.fill_b.price
+                    exit_prices = [signal_gen.token_prices.get(m, pos.current_prices[i])
+                                   for i, m in enumerate(pos.mints)]
+                    execution = executor.execute_exit(pos, exit_prices)
+                    for i, fill in enumerate(execution.fills):
+                        pos.current_prices[i] = fill.price
                     closed = portfolio.close_position(pair_key, 0.0, 0, "dollar_stop",
                                                       exit_fees_usd=execution.estimated_fees_usd)
                     if closed:
                         executor.log_execution(closed.id, execution, 0)
-                        pair_state = signal_gen.get_pair_states().get(pair_key)
-                        if pair_state:
-                            pair_state.in_position = False
+                        basket_state = signal_gen.get_basket_states().get(pair_key)
+                        if basket_state:
+                            basket_state.in_position = False
                         print_exit(closed, f"dollar_stop (lost >{config.max_position_loss_pct:.0%})")
 
             # Time-based exit: close positions older than N half-lives
@@ -313,65 +392,66 @@ async def run_monitor(config: Config, args):
                 if pair_key not in portfolio.positions:
                     continue
                 pos = portfolio.positions[pair_key]
-                pair_state = signal_gen.get_pair_states().get(pair_key)
-                if not pair_state or pair_state.half_life <= 0 or pair_state.half_life == float('inf'):
+                basket_state = signal_gen.get_basket_states().get(pair_key)
+                if not basket_state or basket_state.half_life <= 0 or basket_state.half_life == float('inf'):
                     continue
-                hl_seconds = pair_state.half_life / 2.5
+                hl_seconds = basket_state.half_life / 2.5
                 max_age = hl_seconds * config.max_position_age_half_lives
                 age = now - pos.entry_time
                 if age > max_age:
-                    price_a = signal_gen.token_prices.get(pos.token_a_mint, pos.current_price_a)
-                    price_b = signal_gen.token_prices.get(pos.token_b_mint, pos.current_price_b)
-                    execution = executor.execute_exit(pos, price_a, price_b)
-                    pos.current_price_a = execution.fill_a.price
-                    pos.current_price_b = execution.fill_b.price
+                    exit_prices = [signal_gen.token_prices.get(m, pos.current_prices[i])
+                                   for i, m in enumerate(pos.mints)]
+                    execution = executor.execute_exit(pos, exit_prices)
+                    for i, fill in enumerate(execution.fills):
+                        pos.current_prices[i] = fill.price
                     closed = portfolio.close_position(pair_key, pos.current_zscore, 0, "time_exit",
                                                       exit_fees_usd=execution.estimated_fees_usd)
                     if closed:
                         executor.log_execution(closed.id, execution, 0)
-                        if pair_state:
-                            pair_state.in_position = False
+                        if basket_state:
+                            basket_state.in_position = False
                         print_exit(closed, f"time_exit ({age:.0f}s > {max_age:.0f}s = {config.max_position_age_half_lives}x HL)")
 
             # Orphan cleanup
             for pair_key in list(portfolio.positions.keys()):
                 if pair_key not in portfolio.positions:
                     continue
-                if pair_key in signal_gen.get_pair_states():
+                if pair_key in signal_gen.get_basket_states():
                     continue
                 pos = portfolio.positions[pair_key]
-                price_a = signal_gen.token_prices.get(pos.token_a_mint, pos.current_price_a)
-                price_b = signal_gen.token_prices.get(pos.token_b_mint, pos.current_price_b)
-                if price_a <= 0:
-                    price_a = pos.entry_price_a
-                if price_b <= 0:
-                    price_b = pos.entry_price_b
-                execution = executor.execute_exit(pos, price_a, price_b)
-                pos.current_price_a = execution.fill_a.price
-                pos.current_price_b = execution.fill_b.price
+                exit_prices = []
+                for i, m in enumerate(pos.mints):
+                    p = signal_gen.token_prices.get(m, pos.current_prices[i])
+                    if p <= 0:
+                        p = pos.entry_prices[i]
+                    exit_prices.append(p)
+                execution = executor.execute_exit(pos, exit_prices)
+                for i, fill in enumerate(execution.fills):
+                    pos.current_prices[i] = fill.price
                 closed = portfolio.close_position(pair_key, 0.0, 0, "orphan_cleanup",
                                                   exit_fees_usd=execution.estimated_fees_usd)
                 if closed:
                     executor.log_execution(closed.id, execution, 0)
-                    print_exit(closed, "orphan_cleanup (pair no longer monitored)")
+                    print_exit(closed, "orphan_cleanup (basket no longer monitored)")
 
             # Progress display
             stats['polls'] += 1
             num_prices = len(signal_gen.token_prices)
-            active_pairs = sum(1 for p in signal_gen.get_pair_states().values() if p.prices_a.count > 0)
+            active_baskets = sum(1 for b in signal_gen.get_basket_states().values()
+                                 if b.price_buffers[0].count > 0)
             print_progress(stats['polls'], num_prices, stats['signals'], stats['trades'], start_time)
 
             if stats['polls'] % 10 == 0:
-                pairs_with_min = sum(1 for p in signal_gen.get_pair_states().values()
-                                     if p.prices_a.count >= 10)
+                baskets_with_min = sum(1 for b in signal_gen.get_basket_states().values()
+                                       if b.price_buffers[0].count >= 10)
                 logger.info(f"Prices tracked: {num_prices} tokens | "
-                            f"Active pairs: {active_pairs}/{len(signal_gen.get_pair_states())} | "
-                            f"Pairs with min obs: {pairs_with_min}")
+                            f"Active baskets: {active_baskets}/{len(signal_gen.get_basket_states())} | "
+                            f"Baskets with min obs: {baskets_with_min}")
 
             # Periodic z-score dashboard
             now_f = time.time()
             if now_f - last_dashboard > dashboard_interval:
-                print_zscore_dashboard(signal_gen.get_pair_states())
+                print_zscore_dashboard(signal_gen.get_basket_states())
                 print_positions(portfolio.positions, portfolio.get_total_value())
                 print_discovery_status(signal_gen.discovery)
                 last_dashboard = now_f

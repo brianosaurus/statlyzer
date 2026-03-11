@@ -1,11 +1,11 @@
 """
 Position sizing for statalayer.
-Computes dollar amounts and token quantities for pair trades.
+Computes dollar amounts and token quantities for basket trades (2-4 tokens).
 """
 
 import logging
 from dataclasses import dataclass
-from typing import Optional
+from typing import List, Optional
 
 import numpy as np
 
@@ -17,12 +17,9 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class PositionSize:
-    token_a_amount: float       # Human-readable
-    token_b_amount: float
-    token_a_raw: int            # Raw lamports/units
-    token_b_raw: int
-    dollar_amount_a: float
-    dollar_amount_b: float
+    amounts: List[float]        # Human-readable amount per token
+    amounts_raw: List[int]      # Raw lamports/units per token
+    dollar_amounts: List[float] # USD value per leg
     total_exposure_usd: float
 
 
@@ -32,88 +29,95 @@ def get_decimals(mint: str) -> int:
 
 
 class PositionSizer:
-    """Computes position sizes for pair trades."""
+    """Computes position sizes for basket trades."""
 
     def __init__(self, config):
         self.config = config
 
     def compute_size(self, signal: Signal, portfolio_value: float,
                      current_exposure: float,
-                     price_a: float, price_b: float) -> Optional[PositionSize]:
+                     prices: List[float]) -> Optional[PositionSize]:
         """
-        Compute position size for a pair entry.
+        Compute position size for a basket entry.
 
-        For ENTRY_LONG (z < -threshold): buy A, sell B
-        For ENTRY_SHORT (z > +threshold): sell A, buy B
+        Leg 0 (the reference leg) is sized by fixed fraction or Kelly,
+        then scaled by conviction (z-score magnitude).
+        Other legs are sized proportionally by |hedge_ratios[i] / hedge_ratios[0]|.
 
         Returns None if position would exceed limits.
         """
-        if price_a <= 0 or price_b <= 0:
+        if any(p <= 0 for p in prices):
             return None
 
-        # Compute dollar size
+        # Compute dollar size for the reference leg (index 0)
         if self.config.sizing_method == 'kelly':
             dollar_size = self._kelly_size(
                 portfolio_value, signal.zscore,
-                signal.spread_std, signal.hedge_ratio,
+                signal.spread_std, signal.hedge_ratios,
             )
         else:
             dollar_size = self._fixed_fraction_size(portfolio_value)
 
+        # Conviction scaling: scale up for higher |z| beyond entry threshold
+        # At entry_zscore: 1.0x, at 2x entry_zscore: 1.5x (linear ramp, capped at 1.5x)
+        abs_z = abs(signal.zscore)
+        entry_z = self.config.entry_zscore
+        if abs_z > entry_z and entry_z > 0:
+            conviction = 1.0 + 0.5 * min((abs_z - entry_z) / entry_z, 1.0)
+            dollar_size *= conviction
+
         if dollar_size <= 0:
             return None
 
-        # Hedge ratio determines leg B size relative to leg A
-        hedge = abs(signal.hedge_ratio) if signal.hedge_ratio != 0 else 1.0
+        # Compute relative weights from hedge ratios
+        hr = signal.hedge_ratios
+        abs_hr0 = abs(hr[0]) if hr[0] != 0 else 1.0
+        weights = [abs(h) / abs_hr0 for h in hr]  # weight[0] = 1.0
 
-        # Cap total exposure (both legs) at max_position_usd
-        max_leg_a = self.config.max_position_usd / (1.0 + hedge)
-        dollar_size = min(dollar_size, max_leg_a)
+        total_weight = sum(weights)
 
-        # Check against remaining exposure budget (scales with portfolio value)
+        # Cap total exposure at max_position_usd
+        max_ref_leg = self.config.max_position_usd / total_weight
+        dollar_size = min(dollar_size, max_ref_leg)
+
+        # Check against remaining exposure budget
         max_exposure = portfolio_value * self.config.max_exposure_ratio
         remaining_budget = max_exposure - current_exposure
         if remaining_budget <= 0:
             return None
-        dollar_size = min(dollar_size, remaining_budget / (1.0 + hedge))
+        dollar_size = min(dollar_size, remaining_budget / total_weight)
 
-        # Compute token quantities
-        dollar_a = dollar_size
-        dollar_b = dollar_size * hedge
+        # Compute per-leg dollar amounts and token quantities
+        dollar_amounts = [dollar_size * w for w in weights]
+        amounts = [d / p for d, p in zip(dollar_amounts, prices)]
+        amounts_raw = []
+        for i, mint in enumerate(signal.mints):
+            decimals = get_decimals(mint)
+            raw = int(amounts[i] * (10 ** decimals))
+            amounts_raw.append(raw)
 
-        amount_a = dollar_a / price_a
-        amount_b = dollar_b / price_b
-
-        decimals_a = get_decimals(signal.token_a_mint)
-        decimals_b = get_decimals(signal.token_b_mint)
-
-        raw_a = int(amount_a * (10 ** decimals_a))
-        raw_b = int(amount_b * (10 ** decimals_b))
-
-        if raw_a <= 0 or raw_b <= 0:
+        if any(r <= 0 for r in amounts_raw):
             return None
 
         # Guard against SQLite INTEGER overflow (max 2^63-1)
         max_raw = 2**63 - 1
-        if raw_a > max_raw or raw_b > max_raw:
-            logger.warning(f"Raw quantity overflow for {signal.token_a_symbol}/{signal.token_b_symbol}, skipping")
+        if any(r > max_raw for r in amounts_raw):
+            label = "/".join(signal.symbols)
+            logger.warning(f"Raw quantity overflow for {label}, skipping")
             return None
 
         return PositionSize(
-            token_a_amount=amount_a,
-            token_b_amount=amount_b,
-            token_a_raw=raw_a,
-            token_b_raw=raw_b,
-            dollar_amount_a=dollar_a,
-            dollar_amount_b=dollar_b,
-            total_exposure_usd=dollar_a + dollar_b,
+            amounts=amounts,
+            amounts_raw=amounts_raw,
+            dollar_amounts=dollar_amounts,
+            total_exposure_usd=sum(dollar_amounts),
         )
 
     def _fixed_fraction_size(self, portfolio_value: float) -> float:
         return portfolio_value * self.config.fixed_fraction
 
     def _kelly_size(self, portfolio_value: float, zscore: float,
-                    spread_std: float, hedge_ratio: float) -> float:
+                    spread_std: float, hedge_ratios: list) -> float:
         """
         Kelly criterion sizing.
 

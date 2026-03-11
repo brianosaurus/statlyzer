@@ -3,6 +3,8 @@ Execution layer for statalyzer.
 Paper mode: simulates fills with slippage model.
 Quote mode: fetches real Jupiter quotes for pricing (no execution).
 Live mode: Jupiter swap API + swQoS submission (same infra as arbito).
+
+Supports 2-4 token baskets.
 """
 
 import base64
@@ -12,8 +14,8 @@ import os
 import random
 import time
 import urllib.request
-from dataclasses import dataclass
-from typing import Optional
+from dataclasses import dataclass, field
+from typing import List, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -31,11 +33,10 @@ class Fill:
 
 
 @dataclass
-class PairExecution:
-    fill_a: Fill
-    fill_b: Fill
+class BasketExecution:
+    fills: List[Fill]
     is_paper: bool = True
-    estimated_fees_usd: float = 0.0  # total estimated tx fees for both legs
+    estimated_fees_usd: float = 0.0
 
 
 class PaperExecutor:
@@ -45,90 +46,66 @@ class PaperExecutor:
         self.config = config
         self.db = db
 
-    def execute_entry(self, signal, position_size, price_a: float, price_b: float) -> PairExecution:
-        """Simulate entry fills for both legs."""
+    def execute_entry(self, signal, position_size, prices: List[float]) -> BasketExecution:
+        """Simulate entry fills for all legs."""
         from signals import SignalType
 
         now = int(time.time())
+        hr = signal.hedge_ratios
 
-        # For ENTRY_LONG (z < -threshold): buy A, sell B
-        # For ENTRY_SHORT (z > +threshold): sell A, buy B
-        if signal.signal_type == SignalType.ENTRY_LONG:
-            side_a, side_b = "buy", "sell"
-        else:
-            side_a, side_b = "sell", "buy"
+        fills = []
+        for i in range(signal.basket_size):
+            # Determine side from hedge ratio sign and signal direction
+            signed_hr = hr[i] if signal.signal_type == SignalType.ENTRY_LONG else -hr[i]
+            side = "buy" if signed_hr > 0 else "sell"
 
-        slip_a = self._random_slippage()
-        slip_b = self._random_slippage()
+            slip = self._random_slippage()
+            fill_price = prices[i] * (1 + slip / 10000) if side == "buy" else prices[i] * (1 - slip / 10000)
 
-        # Apply slippage: buying costs more, selling gets less
-        fill_price_a = price_a * (1 + slip_a / 10000) if side_a == "buy" else price_a * (1 - slip_a / 10000)
-        fill_price_b = price_b * (1 + slip_b / 10000) if side_b == "buy" else price_b * (1 - slip_b / 10000)
+            fills.append(Fill(
+                token_mint=signal.mints[i],
+                side=side,
+                price=fill_price,
+                quantity=position_size.amounts[i],
+                quantity_raw=position_size.amounts_raw[i],
+                slippage_bps=slip,
+                timestamp=now,
+            ))
 
-        fill_a = Fill(
-            token_mint=signal.token_a_mint,
-            side=side_a,
-            price=fill_price_a,
-            quantity=position_size.token_a_amount,
-            quantity_raw=position_size.token_a_raw,
-            slippage_bps=slip_a,
-            timestamp=now,
-        )
-        fill_b = Fill(
-            token_mint=signal.token_b_mint,
-            side=side_b,
-            price=fill_price_b,
-            quantity=position_size.token_b_amount,
-            quantity_raw=position_size.token_b_raw,
-            slippage_bps=slip_b,
-            timestamp=now,
-        )
+        return BasketExecution(fills=fills, is_paper=True)
 
-        return PairExecution(fill_a=fill_a, fill_b=fill_b, is_paper=True)
-
-    def execute_exit(self, position, price_a: float, price_b: float) -> PairExecution:
-        """Simulate exit fills for both legs (reverse of entry)."""
+    def execute_exit(self, position, prices: List[float]) -> BasketExecution:
+        """Simulate exit fills for all legs (reverse of entry)."""
         now = int(time.time())
+        hr = position.hedge_ratios
 
-        # Reverse of entry: long exit = sell A, buy B
-        if position.direction == "long":
-            side_a, side_b = "sell", "buy"
-        else:
-            side_a, side_b = "buy", "sell"
+        fills = []
+        for i in range(position.basket_size):
+            # Reverse of entry: flip the sign
+            signed_hr = hr[i] if position.direction == "long" else -hr[i]
+            side = "sell" if signed_hr > 0 else "buy"  # reverse: sell what we bought
 
-        slip_a = self._random_slippage()
-        slip_b = self._random_slippage()
+            slip = self._random_slippage()
+            fill_price = prices[i] * (1 + slip / 10000) if side == "buy" else prices[i] * (1 - slip / 10000)
 
-        fill_price_a = price_a * (1 + slip_a / 10000) if side_a == "buy" else price_a * (1 - slip_a / 10000)
-        fill_price_b = price_b * (1 + slip_b / 10000) if side_b == "buy" else price_b * (1 - slip_b / 10000)
+            fills.append(Fill(
+                token_mint=position.mints[i],
+                side=side,
+                price=fill_price,
+                quantity=position.quantities[i],
+                quantity_raw=position.quantities_raw[i],
+                slippage_bps=slip,
+                timestamp=now,
+            ))
 
-        fill_a = Fill(
-            token_mint=position.token_a_mint,
-            side=side_a,
-            price=fill_price_a,
-            quantity=position.quantity_a,
-            quantity_raw=position.quantity_a_raw,
-            slippage_bps=slip_a,
-            timestamp=now,
-        )
-        fill_b = Fill(
-            token_mint=position.token_b_mint,
-            side=side_b,
-            price=fill_price_b,
-            quantity=position.quantity_b,
-            quantity_raw=position.quantity_b_raw,
-            slippage_bps=slip_b,
-            timestamp=now,
-        )
+        return BasketExecution(fills=fills, is_paper=True)
 
-        return PairExecution(fill_a=fill_a, fill_b=fill_b, is_paper=True)
-
-    def log_execution(self, position_id: int, execution: PairExecution, slot: int):
-        """Persist both fills to the execution_log table."""
-        for leg, fill in [("A", execution.fill_a), ("B", execution.fill_b)]:
+    def log_execution(self, position_id: int, execution: BasketExecution, slot: int):
+        """Persist all fills to the execution_log table."""
+        for i, fill in enumerate(execution.fills):
             self.db.save_execution(
                 position_id=position_id,
-                leg=leg,
+                leg=str(i),
                 side=fill.side,
                 token_mint=fill.token_mint,
                 amount_raw=fill.quantity_raw,
@@ -161,21 +138,19 @@ class QuoteExecutor:
         self._jupiter_api_key = os.getenv('JUPITER_API_KEY', '')
         self.sol_usd_price: float = 0.0  # set by statalyzer main loop
 
-    def _estimate_fees_usd(self) -> float:
-        """Estimate total transaction fees in USD for a pair trade (2 swap legs).
-        With Jito bundles there's also a 3rd tip transaction per bundle."""
+    def _estimate_fees_usd(self, num_legs: int = 2) -> float:
+        """Estimate total transaction fees in USD for a basket trade.
+        With Jito bundles there's also a tip transaction per bundle."""
         if self.sol_usd_price <= 0:
             return 0.0
         per_leg_lamports = self.BASE_TX_FEE_LAMPORTS + self.config.priority_fee_lamports
-        total_lamports = per_leg_lamports * 2  # two swap legs
+        total_lamports = per_leg_lamports * num_legs
         if self.config.use_jito:
-            # Jito tip is paid once per bundle (not per leg), plus base fee for the tip tx
             total_lamports += self.config.jito_tip_lamports + self.BASE_TX_FEE_LAMPORTS
         return (total_lamports / 1e9) * self.sol_usd_price
 
     def _get_prices(self, *mints: str) -> dict:
-        """Fetch USD prices for one or more token mints via Jupiter Price API v3.
-        Returns dict of {mint: usd_price}."""
+        """Fetch USD prices for one or more token mints via Jupiter Price API v3."""
         ids = ",".join(mints)
         url = f"{self.PRICE_API_URL}?ids={ids}"
         try:
@@ -208,7 +183,6 @@ class QuoteExecutor:
             return onchain_price
         if not onchain_price or onchain_price <= 0:
             return jup_price
-        # If Jupiter and on-chain differ by >3x, REJECT — can't trust either source
         ratio = jup_price / onchain_price
         if ratio > 3.0 or ratio < 1/3.0:
             logger.warning(f"Jupiter/on-chain price mismatch for {mint[:8]}..: "
@@ -226,71 +200,65 @@ class QuoteExecutor:
             slippage_bps=0, timestamp=int(time.time()),
         )
 
-    def execute_entry(self, signal, position_size, price_a: float, price_b: float) -> Optional[PairExecution]:
-        """Get Jupiter prices for both tokens and create fills. Returns None if prices unreliable."""
+    def execute_entry(self, signal, position_size, prices: List[float]) -> Optional[BasketExecution]:
+        """Get Jupiter prices for all tokens and create fills."""
         from signals import SignalType
 
-        if signal.signal_type == SignalType.ENTRY_LONG:
-            side_a, side_b = "buy", "sell"
-        else:
-            side_a, side_b = "sell", "buy"
+        hr = signal.hedge_ratios
 
-        # Batch fetch both prices in one call
-        prices = self._get_prices(signal.token_a_mint, signal.token_b_mint)
-        jup_price_a = prices.get(signal.token_a_mint)
-        jup_price_b = prices.get(signal.token_b_mint)
+        # Batch fetch all prices
+        jup_prices = self._get_prices(*signal.mints)
 
-        fill_price_a = self._validate_price(signal.token_a_mint, jup_price_a, price_a)
-        fill_price_b = self._validate_price(signal.token_b_mint, jup_price_b, price_b)
+        fills = []
+        for i in range(signal.basket_size):
+            signed_hr = hr[i] if signal.signal_type == SignalType.ENTRY_LONG else -hr[i]
+            side = "buy" if signed_hr > 0 else "sell"
 
-        if fill_price_a is None or fill_price_b is None:
-            logger.warning(f"Skipping entry {signal.pair_key}: unreliable prices")
-            return None
+            fill_price = self._validate_price(
+                signal.mints[i], jup_prices.get(signal.mints[i]), prices[i])
+            if fill_price is None:
+                logger.warning(f"Skipping entry {signal.pair_key}: unreliable price for leg {i}")
+                return None
 
-        fill_a = self._make_fill(signal.token_a_mint, side_a, fill_price_a,
-                                 position_size.token_a_amount, position_size.token_a_raw)
-        fill_b = self._make_fill(signal.token_b_mint, side_b, fill_price_b,
-                                 position_size.token_b_amount, position_size.token_b_raw)
+            fills.append(self._make_fill(
+                signal.mints[i], side, fill_price,
+                position_size.amounts[i], position_size.amounts_raw[i]))
 
-        return PairExecution(fill_a=fill_a, fill_b=fill_b, is_paper=True,
-                             estimated_fees_usd=self._estimate_fees_usd())
+        return BasketExecution(
+            fills=fills, is_paper=True,
+            estimated_fees_usd=self._estimate_fees_usd(signal.basket_size))
 
-    def execute_exit(self, position, price_a: float, price_b: float) -> PairExecution:
-        """Get Jupiter prices for both tokens on exit.
-        For exits we must close — use entry price as fallback if both sources unreliable."""
-        if position.direction == "long":
-            side_a, side_b = "sell", "buy"
-        else:
-            side_a, side_b = "buy", "sell"
+    def execute_exit(self, position, prices: List[float]) -> BasketExecution:
+        """Get Jupiter prices for all tokens on exit."""
+        hr = position.hedge_ratios
 
-        prices = self._get_prices(position.token_a_mint, position.token_b_mint)
-        fill_price_a = self._validate_price(position.token_a_mint,
-                                            prices.get(position.token_a_mint), price_a)
-        fill_price_b = self._validate_price(position.token_b_mint,
-                                            prices.get(position.token_b_mint), price_b)
+        jup_prices = self._get_prices(*position.mints)
 
-        # For exits, fall back to entry price (0 P&L) rather than refusing to close
-        if fill_price_a is None:
-            logger.warning(f"Exit price unreliable for {position.token_a_mint[:8]}.., using entry price")
-            fill_price_a = position.entry_price_a
-        if fill_price_b is None:
-            logger.warning(f"Exit price unreliable for {position.token_b_mint[:8]}.., using entry price")
-            fill_price_b = position.entry_price_b
+        fills = []
+        for i in range(position.basket_size):
+            signed_hr = hr[i] if position.direction == "long" else -hr[i]
+            side = "sell" if signed_hr > 0 else "buy"
 
-        fill_a = self._make_fill(position.token_a_mint, side_a, fill_price_a,
-                                 position.quantity_a, position.quantity_a_raw)
-        fill_b = self._make_fill(position.token_b_mint, side_b, fill_price_b,
-                                 position.quantity_b, position.quantity_b_raw)
+            fill_price = self._validate_price(
+                position.mints[i], jup_prices.get(position.mints[i]), prices[i])
+            if fill_price is None:
+                logger.warning(f"Exit price unreliable for {position.mints[i][:8]}.., using entry price")
+                fill_price = position.entry_prices[i]
 
-        return PairExecution(fill_a=fill_a, fill_b=fill_b, is_paper=True,
-                             estimated_fees_usd=self._estimate_fees_usd())
+            fills.append(self._make_fill(
+                position.mints[i], side, fill_price,
+                position.quantities[i], position.quantities_raw[i]))
 
-    def log_execution(self, position_id: int, execution: PairExecution, slot: int):
-        """Persist both fills to the execution_log table."""
-        for leg, fill in [("A", execution.fill_a), ("B", execution.fill_b)]:
+        return BasketExecution(
+            fills=fills, is_paper=True,
+            estimated_fees_usd=self._estimate_fees_usd(position.basket_size))
+
+    def log_execution(self, position_id: int, execution: BasketExecution, slot: int):
+        """Persist all fills to the execution_log table."""
+        for i, fill in enumerate(execution.fills):
             self.db.save_execution(
                 position_id=position_id,
-                leg=leg,
+                leg=str(i),
                 side=fill.side,
                 token_mint=fill.token_mint,
                 amount_raw=fill.quantity_raw,
@@ -309,7 +277,8 @@ class QuoteExecutor:
 class LiveExecutor:
     """Live execution via Jupiter swap API + swQoS submission.
     Uses arbito's keypair loading and transaction submission patterns.
-    Routes all swaps through SOL (native wallet currency)."""
+    Routes all swaps through SOL (native wallet currency).
+    Supports 2-4 token baskets (Jito max 5 txs/bundle = 4 swaps + 1 tip)."""
 
     def __init__(self, config, db):
         self.config = config
@@ -380,7 +349,7 @@ class LiveExecutor:
             return None
 
     async def _submit_transaction(self, signed_tx_b64: str) -> tuple:
-        """Submit signed transaction via swQoS endpoint (same as arbito/jito.py)."""
+        """Submit signed transaction via swQoS endpoint."""
         import aiohttp
         payload = {
             "jsonrpc": "2.0",
@@ -447,7 +416,6 @@ class LiveExecutor:
                       price_fallback: float) -> tuple:
         """Get quote, build swap tx, sign, submit. Returns (Fill, signature)."""
         import asyncio
-        import base64
         from solders.transaction import VersionedTransaction
         from position import get_decimals
 
@@ -459,14 +427,11 @@ class LiveExecutor:
         if not swap_tx_b64:
             raise RuntimeError(f"Jupiter swap tx failed for {input_mint[:8]}→{output_mint[:8]}")
 
-        # Deserialize, sign, re-serialize
         tx_bytes = base64.b64decode(swap_tx_b64)
         tx = VersionedTransaction.from_bytes(tx_bytes)
-        # Jupiter returns an unsigned tx; sign it with our keypair
         signed_tx = VersionedTransaction(tx.message, [self._keypair])
         signed_b64 = base64.b64encode(bytes(signed_tx)).decode()
 
-        # Submit
         loop = asyncio.get_event_loop()
         success, signature, error = loop.run_until_complete(self._submit_transaction(signed_b64))
         if not success:
@@ -474,61 +439,69 @@ class LiveExecutor:
 
         logger.info(f"Swap submitted: {signature}")
 
-        # Confirm
         confirmed = loop.run_until_complete(self._confirm_transaction(signature))
         if not confirmed:
             logger.warning(f"Swap not confirmed within timeout, proceeding with quote price")
 
-        # Compute fill price from quote
+        fill = self._fill_from_quote(quote, token_mint, side, quantity, quantity_raw,
+                                     price_fallback, signature)
+        return fill, signature
+
+    def _fill_from_quote(self, quote: dict, token_mint: str, side: str,
+                         quantity: float, quantity_raw: int,
+                         price_fallback: float, tx_signature: str = None) -> Fill:
+        """Create a Fill from a Jupiter quote response."""
+        from position import get_decimals
+        from constants import SOL_MINT
+
         in_amt = int(quote.get("inAmount", 0))
         out_amt = int(quote.get("outAmount", 0))
-        in_dec = get_decimals(input_mint)
-        out_dec = get_decimals(output_mint)
+        in_mint = quote.get("inputMint", "")
+        out_mint = quote.get("outputMint", "")
+        in_dec = get_decimals(in_mint)
+        out_dec = get_decimals(out_mint)
         price_impact = float(quote.get("priceImpactPct", 0))
 
-        # Price in USD: convert SOL amounts via SOL/USD price
-        from constants import SOL_MINT
-        if input_mint == SOL_MINT and out_amt > 0 and self.sol_usd_price > 0:
-            # Bought token with SOL: price = (SOL spent * SOL/USD) / tokens received
+        if in_mint == SOL_MINT and out_amt > 0 and self.sol_usd_price > 0:
             sol_spent = in_amt / 10**9
             fill_price = (sol_spent * self.sol_usd_price) / (out_amt / 10**out_dec)
-        elif output_mint == SOL_MINT and in_amt > 0 and self.sol_usd_price > 0:
-            # Sold token for SOL: price = (SOL received * SOL/USD) / tokens sold
+        elif out_mint == SOL_MINT and in_amt > 0 and self.sol_usd_price > 0:
             sol_received = out_amt / 10**9
             fill_price = (sol_received * self.sol_usd_price) / (in_amt / 10**in_dec)
         else:
             fill_price = price_fallback
 
-        fill = Fill(
-            token_mint=token_mint,
-            side=side,
-            price=fill_price,
-            quantity=quantity,
-            quantity_raw=quantity_raw,
+        return Fill(
+            token_mint=token_mint, side=side, price=fill_price,
+            quantity=quantity, quantity_raw=quantity_raw,
             slippage_bps=abs(price_impact) * 10000,
-            timestamp=int(time.time()),
-            tx_signature=signature,
+            timestamp=int(time.time()), tx_signature=tx_signature,
         )
-        return fill, signature
 
     # --- Jito Bundle Methods ---
 
-    def _build_tip_instruction(self):
-        """Create a SOL transfer instruction to a random Jito tip account."""
-        from solders.pubkey import Pubkey
-        from solders.system_program import transfer, TransferParams
-        from constants import JITO_TIP_ACCOUNTS
+    def _execute_swap_no_submit(self, input_mint: str, output_mint: str, amount_raw: int) -> tuple:
+        """Get quote and build signed swap transaction without submitting.
+        Returns (signed_tx_b64, quote) for use in bundles."""
+        from solders.transaction import VersionedTransaction
 
-        tip_account = random.choice(list(JITO_TIP_ACCOUNTS))
-        return transfer(TransferParams(
-            from_pubkey=Pubkey.from_string(self._pubkey),
-            to_pubkey=Pubkey.from_string(tip_account),
-            lamports=self.config.jito_tip_lamports,
-        ))
+        quote = self._get_quote(input_mint, output_mint, amount_raw)
+        if not quote:
+            raise RuntimeError(f"Jupiter quote failed for {input_mint[:8]}→{output_mint[:8]}")
+
+        swap_tx_b64 = self._get_swap_transaction(quote)
+        if not swap_tx_b64:
+            raise RuntimeError(f"Jupiter swap tx failed for {input_mint[:8]}→{output_mint[:8]}")
+
+        tx_bytes = base64.b64decode(swap_tx_b64)
+        tx = VersionedTransaction.from_bytes(tx_bytes)
+        signed_tx = VersionedTransaction(tx.message, [self._keypair])
+        signed_b64 = base64.b64encode(bytes(signed_tx)).decode()
+
+        return signed_b64, quote
 
     def _submit_bundle(self, signed_txs_b64: list) -> Optional[str]:
-        """Submit a bundle of base64-encoded signed transactions to Jito block engine.
-        Returns bundle_id on success, None on failure."""
+        """Submit a bundle of base64-encoded signed transactions to Jito block engine."""
         url = f"{self.config.jito_block_engine}/api/v1/bundles"
         payload = json.dumps({
             "jsonrpc": "2.0",
@@ -594,63 +567,15 @@ class LiveExecutor:
         logger.warning(f"Jito bundle confirmation timeout: {bundle_id}")
         return False, []
 
-    def _execute_swap_no_submit(self, input_mint: str, output_mint: str, amount_raw: int) -> tuple:
-        """Get quote and build signed swap transaction without submitting.
-        Returns (signed_tx_b64, quote) for use in bundles."""
-        from solders.transaction import VersionedTransaction
-
-        quote = self._get_quote(input_mint, output_mint, amount_raw)
-        if not quote:
-            raise RuntimeError(f"Jupiter quote failed for {input_mint[:8]}→{output_mint[:8]}")
-
-        swap_tx_b64 = self._get_swap_transaction(quote)
-        if not swap_tx_b64:
-            raise RuntimeError(f"Jupiter swap tx failed for {input_mint[:8]}→{output_mint[:8]}")
-
-        # Deserialize, sign, re-serialize
-        tx_bytes = base64.b64decode(swap_tx_b64)
-        tx = VersionedTransaction.from_bytes(tx_bytes)
-        signed_tx = VersionedTransaction(tx.message, [self._keypair])
-        signed_b64 = base64.b64encode(bytes(signed_tx)).decode()
-
-        return signed_b64, quote
-
-    def _fill_from_quote(self, quote: dict, token_mint: str, side: str,
-                         quantity: float, quantity_raw: int,
-                         price_fallback: float, tx_signature: str = None) -> Fill:
-        """Create a Fill from a Jupiter quote response."""
-        from position import get_decimals
-        from constants import SOL_MINT
-
-        in_amt = int(quote.get("inAmount", 0))
-        out_amt = int(quote.get("outAmount", 0))
-        in_mint = quote.get("inputMint", "")
-        out_mint = quote.get("outputMint", "")
-        in_dec = get_decimals(in_mint)
-        out_dec = get_decimals(out_mint)
-        price_impact = float(quote.get("priceImpactPct", 0))
-
-        if in_mint == SOL_MINT and out_amt > 0 and self.sol_usd_price > 0:
-            sol_spent = in_amt / 10**9
-            fill_price = (sol_spent * self.sol_usd_price) / (out_amt / 10**out_dec)
-        elif out_mint == SOL_MINT and in_amt > 0 and self.sol_usd_price > 0:
-            sol_received = out_amt / 10**9
-            fill_price = (sol_received * self.sol_usd_price) / (in_amt / 10**in_dec)
-        else:
-            fill_price = price_fallback
-
-        return Fill(
-            token_mint=token_mint, side=side, price=fill_price,
-            quantity=quantity, quantity_raw=quantity_raw,
-            slippage_bps=abs(price_impact) * 10000,
-            timestamp=int(time.time()), tx_signature=tx_signature,
-        )
-
-    def _execute_pair_bundle(self, legs: list) -> PairExecution:
-        """Execute both legs atomically via Jito bundle.
+    def _execute_basket_bundle(self, legs: list) -> BasketExecution:
+        """Execute all legs atomically via Jito bundle.
         legs: list of (input_mint, output_mint, amount_raw, token_mint, side, quantity, quantity_raw, price_fallback)
+        Max 4 swap legs + 1 tip = 5 txs (Jito limit).
         """
-        # Build signed transactions for both legs
+        if len(legs) > 4:
+            raise RuntimeError(f"Jito bundle supports max 4 swap legs, got {len(legs)}")
+
+        # Build signed transactions for all legs
         signed_txs = []
         quotes = []
         for input_mint, output_mint, amount_raw, *_ in legs:
@@ -658,9 +583,7 @@ class LiveExecutor:
             signed_txs.append(signed_b64)
             quotes.append(quote)
 
-        # TODO: Ideally add tip instruction to the last transaction.
-        # For now, create a separate tip transaction as the third tx in the bundle.
-        # This is simpler and Jito supports up to 5 txs per bundle.
+        # Create tip transaction
         from solders.pubkey import Pubkey
         from solders.system_program import transfer, TransferParams
         from solders.transaction import Transaction
@@ -714,103 +637,90 @@ class LiveExecutor:
             raise RuntimeError(f"Jito bundle did not land: {bundle_id}")
 
         # Build fills from quotes
-        sig_a = tx_sigs[0] if len(tx_sigs) > 0 else None
-        sig_b = tx_sigs[1] if len(tx_sigs) > 1 else None
-        _, _, _, token_mint_a, side_a, qty_a, qty_raw_a, price_fb_a = legs[0]
-        _, _, _, token_mint_b, side_b, qty_b, qty_raw_b, price_fb_b = legs[1]
+        fills = []
+        for i, leg in enumerate(legs):
+            _, _, _, token_mint, side, qty, qty_raw, price_fb = leg
+            sig = tx_sigs[i] if i < len(tx_sigs) else None
+            fill = self._fill_from_quote(quotes[i], token_mint, side, qty, qty_raw, price_fb, sig)
+            fills.append(fill)
 
-        fill_a = self._fill_from_quote(quotes[0], token_mint_a, side_a, qty_a, qty_raw_a, price_fb_a, sig_a)
-        fill_b = self._fill_from_quote(quotes[1], token_mint_b, side_b, qty_b, qty_raw_b, price_fb_b, sig_b)
+        mints_short = [legs[i][3][:8] for i in range(len(legs))]
+        logger.info(f"Bundle landed: {len(fills)} legs, mints={mints_short}")
 
-        logger.info(f"Bundle landed: {side_a} {token_mint_a[:8]}.. @ ${fill_a.price:.6f}, "
-                     f"{side_b} {token_mint_b[:8]}.. @ ${fill_b.price:.6f}")
-
-        return PairExecution(fill_a=fill_a, fill_b=fill_b, is_paper=False)
+        return BasketExecution(fills=fills, is_paper=False)
 
     # --- Entry/Exit Methods ---
 
-    def execute_entry(self, signal, position_size, price_a: float, price_b: float) -> PairExecution:
+    def execute_entry(self, signal, position_size, prices: List[float]) -> BasketExecution:
         """Execute entry via Jupiter swaps (Jito bundle or sequential).
-        Routes through SOL: buy both tokens with SOL on entry."""
+        Routes through SOL: buy all tokens with SOL on entry."""
         from signals import SignalType
         from constants import SOL_MINT
 
-        if signal.signal_type == SignalType.ENTRY_LONG:
-            side_a, side_b = "buy", "sell"
-        else:
-            side_a, side_b = "sell", "buy"
+        hr = signal.hedge_ratios
 
-        # For token/token stat-arb, entry always buys both tokens from SOL.
-        # "buy" = SOL → Token, "sell" = SOL → Token (we buy both sides on entry)
-        # The direction (long/short) only affects P&L calculation, not execution.
-        # Convert USD value to SOL lamports for input amount
         def _usd_to_sol_lamports(usd_value: float) -> int:
             if self.sol_usd_price <= 0:
                 raise RuntimeError("SOL/USD price not available for live execution")
             return int((usd_value / self.sol_usd_price) * 10**9)
 
-        sol_amount_a = _usd_to_sol_lamports(position_size.token_a_amount * price_a)
-        sol_amount_b = _usd_to_sol_lamports(position_size.token_b_amount * price_b)
+        legs = []
+        for i in range(signal.basket_size):
+            signed_hr = hr[i] if signal.signal_type == SignalType.ENTRY_LONG else -hr[i]
+            side = "buy" if signed_hr > 0 else "sell"
+            sol_amount = _usd_to_sol_lamports(position_size.amounts[i] * prices[i])
+            legs.append((SOL_MINT, signal.mints[i], sol_amount,
+                         signal.mints[i], side, position_size.amounts[i],
+                         position_size.amounts_raw[i], prices[i]))
 
         if self.config.use_jito:
-            leg_a = (SOL_MINT, signal.token_a_mint, sol_amount_a,
-                     signal.token_a_mint, side_a, position_size.token_a_amount, position_size.token_a_raw, price_a)
-            leg_b = (SOL_MINT, signal.token_b_mint, sol_amount_b,
-                     signal.token_b_mint, side_b, position_size.token_b_amount, position_size.token_b_raw, price_b)
-            return self._execute_pair_bundle([leg_a, leg_b])
+            return self._execute_basket_bundle(legs)
 
         # Sequential fallback (no Jito)
-        fill_a, sig_a = self._execute_swap(
-            SOL_MINT, signal.token_a_mint, sol_amount_a,
-            signal.token_a_mint, side_a,
-            position_size.token_a_amount, position_size.token_a_raw, price_a)
-        logger.info(f"Leg A done: {side_a} {signal.token_a_mint[:8]}.. @ ${fill_a.price:.6f} | tx: {sig_a}")
+        fills = []
+        for i, leg in enumerate(legs):
+            input_mint, output_mint, amount_raw, token_mint, side, qty, qty_raw, price_fb = leg
+            fill, sig = self._execute_swap(input_mint, output_mint, amount_raw,
+                                           token_mint, side, qty, qty_raw, price_fb)
+            logger.info(f"Leg {i} done: {side} {token_mint[:8]}.. @ ${fill.price:.6f} | tx: {sig}")
+            fills.append(fill)
 
-        fill_b, sig_b = self._execute_swap(
-            SOL_MINT, signal.token_b_mint, sol_amount_b,
-            signal.token_b_mint, side_b,
-            position_size.token_b_amount, position_size.token_b_raw, price_b)
-        logger.info(f"Leg B done: {side_b} {signal.token_b_mint[:8]}.. @ ${fill_b.price:.6f} | tx: {sig_b}")
+        return BasketExecution(fills=fills, is_paper=False)
 
-        return PairExecution(fill_a=fill_a, fill_b=fill_b, is_paper=False)
-
-    def execute_exit(self, position, price_a: float, price_b: float) -> PairExecution:
+    def execute_exit(self, position, prices: List[float]) -> BasketExecution:
         """Execute exit via Jupiter swaps (Jito bundle or sequential).
-        Routes through SOL: sell both tokens back to SOL on exit."""
+        Routes through SOL: sell all tokens back to SOL on exit."""
         from constants import SOL_MINT
 
-        if position.direction == "long":
-            side_a, side_b = "sell", "buy"
-        else:
-            side_a, side_b = "buy", "sell"
+        hr = position.hedge_ratios
 
-        # Exit always sells both tokens back to SOL
+        legs = []
+        for i in range(position.basket_size):
+            signed_hr = hr[i] if position.direction == "long" else -hr[i]
+            side = "sell" if signed_hr > 0 else "buy"
+            legs.append((position.mints[i], SOL_MINT, position.quantities_raw[i],
+                         position.mints[i], side, position.quantities[i],
+                         position.quantities_raw[i], prices[i]))
+
         if self.config.use_jito:
-            leg_a = (position.token_a_mint, SOL_MINT, position.quantity_a_raw,
-                     position.token_a_mint, side_a, position.quantity_a, position.quantity_a_raw, price_a)
-            leg_b = (position.token_b_mint, SOL_MINT, position.quantity_b_raw,
-                     position.token_b_mint, side_b, position.quantity_b, position.quantity_b_raw, price_b)
-            return self._execute_pair_bundle([leg_a, leg_b])
+            return self._execute_basket_bundle(legs)
 
         # Sequential fallback (no Jito)
-        fill_a, sig_a = self._execute_swap(
-            position.token_a_mint, SOL_MINT, position.quantity_a_raw,
-            position.token_a_mint, side_a,
-            position.quantity_a, position.quantity_a_raw, price_a)
+        fills = []
+        for i, leg in enumerate(legs):
+            input_mint, output_mint, amount_raw, token_mint, side, qty, qty_raw, price_fb = leg
+            fill, sig = self._execute_swap(input_mint, output_mint, amount_raw,
+                                           token_mint, side, qty, qty_raw, price_fb)
+            fills.append(fill)
 
-        fill_b, sig_b = self._execute_swap(
-            position.token_b_mint, SOL_MINT, position.quantity_b_raw,
-            position.token_b_mint, side_b,
-            position.quantity_b, position.quantity_b_raw, price_b)
+        return BasketExecution(fills=fills, is_paper=False)
 
-        return PairExecution(fill_a=fill_a, fill_b=fill_b, is_paper=False)
-
-    def log_execution(self, position_id: int, execution: PairExecution, slot: int):
-        """Persist both fills to the execution_log table."""
-        for leg, fill in [("A", execution.fill_a), ("B", execution.fill_b)]:
+    def log_execution(self, position_id: int, execution: BasketExecution, slot: int):
+        """Persist all fills to the execution_log table."""
+        for i, fill in enumerate(execution.fills):
             self.db.save_execution(
                 position_id=position_id,
-                leg=leg,
+                leg=str(i),
                 side=fill.side,
                 token_mint=fill.token_mint,
                 amount_raw=fill.quantity_raw,

@@ -1,9 +1,10 @@
 """
 Signal generator for statalayer.
-Monitors cointegrated pairs, computes rolling z-scores from Jupiter prices,
-and emits entry/exit signals.
+Monitors cointegrated baskets (2-4 tokens), computes rolling z-scores
+from Jupiter prices, and emits entry/exit signals.
 """
 
+import json
 import logging
 import time
 from dataclasses import dataclass, field
@@ -27,13 +28,12 @@ class SignalType(Enum):
 @dataclass
 class Signal:
     signal_type: SignalType
-    pair_key: str
-    token_a_mint: str
-    token_b_mint: str
-    token_a_symbol: str
-    token_b_symbol: str
+    pair_key: str             # basket key (comma-separated sorted mints)
+    basket_size: int          # 2, 3, or 4
+    mints: List[str]          # sorted token mints
+    symbols: List[str]        # corresponding symbols
+    hedge_ratios: List[float] # Johansen eigenvector weights (length N)
     zscore: float
-    hedge_ratio: float
     spread: float
     spread_mean: float
     spread_std: float
@@ -74,20 +74,18 @@ class CircularBuffer:
 
 
 @dataclass
-class PairState:
-    """Tracks rolling price window and cointegration params for one pair."""
-    pair_key: str
-    token_a_mint: str
-    token_b_mint: str
-    token_a_symbol: str
-    token_b_symbol: str
-    hedge_ratio: float
+class BasketState:
+    """Tracks rolling price window and cointegration params for one basket."""
+    pair_key: str             # basket key (comma-separated sorted mints)
+    basket_size: int          # 2, 3, or 4
+    mints: List[str]          # sorted token mints
+    symbols: List[str]        # corresponding symbols
+    hedge_ratios: List[float] # Johansen eigenvector weights (length N)
     half_life: float
     eg_p_value: float
 
-    # Rolling price buffers
-    prices_a: CircularBuffer = field(default=None, repr=False)
-    prices_b: CircularBuffer = field(default=None, repr=False)
+    # Rolling log-price buffers: one per token
+    price_buffers: List[CircularBuffer] = field(default=None, repr=False)
 
     # Cached z-score
     current_zscore: float = 0.0
@@ -99,19 +97,23 @@ class PairState:
     in_position: bool = False
     position_entry_time: float = 0.0
 
-    # Resampling state: accumulate latest price, flush to buffer at fixed intervals
-    pending_price_a: float = 0.0
-    pending_price_b: float = 0.0
+    # Resampling state: latest pending price per token
+    pending_prices: List[float] = field(default=None, repr=False)
     last_resample_time: float = 0.0
 
     def init_buffers(self, capacity: int):
-        self.prices_a = CircularBuffer(capacity)
-        self.prices_b = CircularBuffer(capacity)
+        self.price_buffers = [CircularBuffer(capacity) for _ in range(self.basket_size)]
+        self.pending_prices = [0.0] * self.basket_size
 
 
+def make_basket_key(mints: List[str]) -> str:
+    """Canonical basket key — comma-separated sorted mints."""
+    return ",".join(sorted(mints))
+
+
+# Backward compat alias
 def make_pair_key(mint_a: str, mint_b: str) -> str:
-    """Canonical pair key — lexicographic order to avoid duplicates."""
-    return f"{min(mint_a, mint_b)}:{max(mint_a, mint_b)}"
+    return make_basket_key([mint_a, mint_b])
 
 
 def token_symbol(mint: str) -> str:
@@ -120,125 +122,121 @@ def token_symbol(mint: str) -> str:
 
 
 class SignalGenerator:
-    """Monitors cointegrated pairs and generates trading signals."""
+    """Monitors cointegrated baskets and generates trading signals."""
 
     def __init__(self, config, scanner_db_path: str = None, db=None):
         self.config = config
         self.scanner_db_path = scanner_db_path
         self.db = db  # For candle persistence
-        self.pairs: Dict[str, PairState] = {}
+        self.baskets: Dict[str, BasketState] = {}
         self.token_prices: Dict[str, float] = {}  # USD-normalized prices
         self.monitored_mints: Set[str] = set()
         self.last_pair_reload = 0
         self.pair_reload_interval = 900  # 15 minutes
         self.sol_usd_price: float = 0.0  # cached SOL/USD
-        self._candle_save_count = 0  # batch commit counter
 
         # Inline cointegration discovery
         from cointegration import CointegrationDiscovery
         self.discovery = CointegrationDiscovery(config, WELL_KNOWN_TOKENS, STABLECOIN_MINTS)
 
-    def load_pairs(self) -> int:
-        """Load cointegrated pairs from scanner DB."""
+    def load_baskets(self) -> int:
+        """Load cointegrated baskets from scanner DB."""
         if not self.scanner_db_path:
             return 0
 
         from db import Database
 
-        pairs_data = Database.read_cointegrated_pairs(self.scanner_db_path)
-        if not pairs_data:
-            logger.warning("No cointegrated pairs found in scanner DB")
+        baskets_data = Database.read_cointegrated_baskets(self.scanner_db_path)
+        if not baskets_data:
+            logger.warning("No cointegrated baskets found in scanner DB")
             return 0
 
-        # Track which base tokens already have a stablecoin pair (dedup USDC/USDT/USDH)
-        base_with_stable: Dict[str, str] = {}  # base_mint -> preferred quote mint
-
         loaded = 0
-        skipped_dup = 0
+        skipped_stable = 0
         skipped_unknown = 0
-        for p in pairs_data:
+        for b in baskets_data:
             # Half-life filter
-            # Scanner half-lives are in 5-min resampling periods; convert to blocks
-            # 1 period = 300s, 1 block ≈ 0.4s → 1 period ≈ 750 blocks
-            hl_periods = p.get('half_life', float('inf'))
+            hl_periods = b.get('half_life', float('inf'))
             if hl_periods == float('inf') or hl_periods <= 0:
-                continue  # No mean reversion — skip
-            hl = hl_periods * 750  # Convert to blocks
+                continue
+            hl = hl_periods * 750  # Convert resampling periods to blocks
             if hl < self.config.min_half_life:
                 continue
-            # lookback_window is in candles; convert to blocks for half-life comparison
             lookback_blocks = self.config.lookback_window * self.config.signal_resample_secs / 0.4
             if hl > lookback_blocks * self.config.max_half_life_ratio:
                 continue
 
             # Staleness filter
-            analyzed_at = p.get('analyzed_at', 0)
+            analyzed_at = b.get('analyzed_at', 0)
             if isinstance(analyzed_at, str):
                 try:
-                    analyzed_at = int(analyzed_at)
+                    analyzed_at = int(float(analyzed_at))
                 except ValueError:
                     analyzed_at = 0
             age_hours = (time.time() - analyzed_at) / 3600 if analyzed_at > 0 else float('inf')
             if age_hours > self.config.pair_staleness_hours:
                 continue
 
-            mint_a = p['token_a_mint']
-            mint_b = p['token_b_mint']
+            mints = b['mints']
+            symbols = b['symbols']
+            hedge_ratios = b['hedge_ratios']
+            basket_size = len(mints)
 
             # Well-known token filter: require at least ONE token to be known
-            if mint_a not in WELL_KNOWN_TOKENS and mint_b not in WELL_KNOWN_TOKENS:
+            if not any(m in WELL_KNOWN_TOKENS for m in mints):
                 skipped_unknown += 1
                 continue
 
-            # Skip stablecoin pairs entirely — USDC/TOKEN is not real stat-arb,
-            # it's just single-directional token trading with no mean-reverting spread
-            stable_mints = STABLECOIN_MINTS
-            if mint_a in stable_mints or mint_b in stable_mints:
-                skipped_dup += 1
+            # Skip baskets containing stablecoins
+            if any(m in STABLECOIN_MINTS for m in mints):
+                skipped_stable += 1
                 continue
 
-            pair_key = make_pair_key(mint_a, mint_b)
+            basket_key = make_basket_key(mints)
 
-            if pair_key in self.pairs:
-                # Update existing pair's params
-                self.pairs[pair_key].hedge_ratio = p['hedge_ratio']
-                self.pairs[pair_key].half_life = hl
-                self.pairs[pair_key].cointegration_analyzed_at = analyzed_at
+            if basket_key in self.baskets:
+                # Update existing basket's params
+                self.baskets[basket_key].hedge_ratios = hedge_ratios
+                self.baskets[basket_key].half_life = hl
+                self.baskets[basket_key].cointegration_analyzed_at = analyzed_at
             else:
-                state = PairState(
-                    pair_key=pair_key,
-                    token_a_mint=mint_a,
-                    token_b_mint=mint_b,
-                    token_a_symbol=p.get('token_a_symbol', token_symbol(mint_a)),
-                    token_b_symbol=p.get('token_b_symbol', token_symbol(mint_b)),
-                    hedge_ratio=p['hedge_ratio'],
+                state = BasketState(
+                    pair_key=basket_key,
+                    basket_size=basket_size,
+                    mints=mints,
+                    symbols=symbols,
+                    hedge_ratios=hedge_ratios,
                     half_life=hl,
-                    eg_p_value=p.get('eg_p_value', 1.0),
+                    eg_p_value=b.get('eg_p_value', 1.0) or 1.0,
                     cointegration_analyzed_at=analyzed_at,
                 )
                 state.init_buffers(self.config.lookback_window)
                 self._restore_candles(state)
-                self.pairs[pair_key] = state
+                self.baskets[basket_key] = state
 
-            self.monitored_mints.add(mint_a)
-            self.monitored_mints.add(mint_b)
+            for m in mints:
+                self.monitored_mints.add(m)
             loaded += 1
 
-        if skipped_dup or skipped_unknown:
-            logger.info(f"Skipped {skipped_dup} duplicate stablecoin pairs, "
-                        f"{skipped_unknown} pairs with no well-known token")
+        if skipped_stable or skipped_unknown:
+            logger.info(f"Skipped {skipped_stable} stablecoin baskets, "
+                        f"{skipped_unknown} baskets with no well-known token")
 
         self.last_pair_reload = time.time()
-        logger.info(f"Loaded {loaded} cointegrated pairs, monitoring {len(self.monitored_mints)} tokens")
+        logger.info(f"Loaded {loaded} cointegrated baskets, monitoring {len(self.monitored_mints)} tokens")
         return loaded
 
+    # Backward compat alias
+    def load_pairs(self) -> int:
+        return self.load_baskets()
+
     def load_discovered_pairs(self, results) -> int:
-        """Load pairs discovered by inline cointegration analysis."""
+        """Load pairs discovered by inline cointegration analysis.
+        Converts 2-token CointResult to basket format."""
         loaded = 0
         for r in results:
             if not r.eg_is_cointegrated:
                 continue
-            # Skip stablecoin pairs — not real stat-arb
             if r.token_a_mint in STABLECOIN_MINTS or r.token_b_mint in STABLECOIN_MINTS:
                 continue
             # Convert half-life from resampled periods to blocks
@@ -250,40 +248,49 @@ class SignalGenerator:
             if hl_blocks > max_hl:
                 continue
 
-            pair_key = make_pair_key(r.token_a_mint, r.token_b_mint)
-            if pair_key in self.pairs:
-                # Update existing pair's params
-                self.pairs[pair_key].hedge_ratio = r.hedge_ratio
-                self.pairs[pair_key].half_life = hl_blocks
-                self.pairs[pair_key].cointegration_analyzed_at = int(r.analyzed_at)
+            # Convert pair to basket format
+            mints = sorted([r.token_a_mint, r.token_b_mint])
+            symbols = [token_symbol(m) for m in mints]
+            # Convert scalar hedge_ratio to eigenvector: [1.0, -hr] for canonical order
+            # If token_a_mint < token_b_mint, spread = log(a) - hr*log(b) → [1.0, -hr]
+            # If reversed, flip signs
+            if r.token_a_mint == mints[0]:
+                hedge_ratios = [1.0, -r.hedge_ratio]
             else:
-                state = PairState(
-                    pair_key=pair_key,
-                    token_a_mint=r.token_a_mint,
-                    token_b_mint=r.token_b_mint,
-                    token_a_symbol=r.token_a_symbol,
-                    token_b_symbol=r.token_b_symbol,
-                    hedge_ratio=r.hedge_ratio,
+                hedge_ratios = [-r.hedge_ratio, 1.0]
+
+            basket_key = make_basket_key(mints)
+            if basket_key in self.baskets:
+                self.baskets[basket_key].hedge_ratios = hedge_ratios
+                self.baskets[basket_key].half_life = hl_blocks
+                self.baskets[basket_key].cointegration_analyzed_at = int(r.analyzed_at)
+            else:
+                state = BasketState(
+                    pair_key=basket_key,
+                    basket_size=2,
+                    mints=mints,
+                    symbols=symbols,
+                    hedge_ratios=hedge_ratios,
                     half_life=hl_blocks,
                     eg_p_value=r.eg_p_value,
                     cointegration_analyzed_at=int(r.analyzed_at),
                 )
                 state.init_buffers(self.config.lookback_window)
                 self._restore_candles(state)
-                self.pairs[pair_key] = state
-                logger.info(f"Discovered pair: {r.token_a_symbol}/{r.token_b_symbol} "
-                            f"p={r.eg_p_value:.4f} hl={hl_blocks:.0f}blk hr={r.hedge_ratio:.4f}")
+                self.baskets[basket_key] = state
+                logger.info(f"Discovered pair: {'/'.join(symbols)} "
+                            f"p={r.eg_p_value:.4f} hl={hl_blocks:.0f}blk hr={hedge_ratios}")
 
-            self.monitored_mints.add(r.token_a_mint)
-            self.monitored_mints.add(r.token_b_mint)
+            for m in mints:
+                self.monitored_mints.add(m)
             loaded += 1
         return loaded
 
     def process_prices(self, new_prices: Dict[str, float], timestamp: float) -> List[Signal]:
         """Process a batch of Jupiter prices and return any triggered signals."""
-        # Periodic pair reload from scanner DB
+        # Periodic basket reload from scanner DB
         if self.scanner_db_path and time.time() - self.last_pair_reload > self.pair_reload_interval:
-            self.load_pairs()
+            self.load_baskets()
 
         if not new_prices:
             self.discovery.update_prices(self.token_prices, timestamp)
@@ -314,36 +321,41 @@ class SignalGenerator:
         if new_pairs:
             added = self.load_discovered_pairs(new_pairs)
             if added > 0:
-                logger.info(f"Discovery added {added} pairs, now monitoring {len(self.pairs)} total")
+                logger.info(f"Discovery added {added} pairs, now monitoring {len(self.baskets)} total")
 
-        # Update each monitored pair and check for signals
+        # Update each monitored basket and check for signals
         signals = []
-        for pair in self.pairs.values():
-            price_a = new_prices.get(pair.token_a_mint)
-            price_b = new_prices.get(pair.token_b_mint)
+        for basket in self.baskets.values():
+            # Gather prices for all tokens in the basket
+            prices = []
+            any_new = False
+            for mint in basket.mints:
+                p = new_prices.get(mint)
+                if p is not None:
+                    any_new = True
+                    prices.append(p)
+                else:
+                    # Use latest known price
+                    p = self.token_prices.get(mint)
+                    if p is None:
+                        break
+                    prices.append(p)
 
-            if price_a is None and price_b is None:
+            if len(prices) != basket.basket_size:
+                continue  # Missing price for at least one token
+            if not any_new:
+                continue  # No new prices for any token
+            if any(p <= 0 for p in prices):
                 continue
 
-            # Use latest known price if only one updated
-            if price_a is None:
-                price_a = self.token_prices.get(pair.token_a_mint)
-            if price_b is None:
-                price_b = self.token_prices.get(pair.token_b_mint)
-
-            if price_a is None or price_b is None:
-                continue
-            if price_a <= 0 or price_b <= 0:
-                continue
-
-            signal = self._update_pair(pair, price_a, price_b, 0, timestamp)
+            signal = self._update_basket(basket, prices, 0, timestamp)
             if signal is not None:
                 signals.append(signal)
 
         return signals
 
     def all_mints(self) -> Set[str]:
-        """Return all mints that need pricing (monitored pairs + discovery tokens)."""
+        """Return all mints that need pricing (monitored baskets + discovery tokens)."""
         mints = set(self.monitored_mints)
         # Include well-known tokens for cointegration discovery
         for mint in WELL_KNOWN_TOKENS:
@@ -352,154 +364,154 @@ class SignalGenerator:
         mints.add(SOL_MINT)
         return mints
 
-    def _restore_candles(self, pair: PairState):
-        """Restore saved candles from DB into the pair's circular buffers."""
+    def _restore_candles(self, basket: BasketState):
+        """Restore saved candles from DB into the basket's circular buffers."""
         if not self.db:
             return
-        candles = self.db.load_candles(pair.pair_key, self.config.lookback_window)
+        candles = self.db.load_candles(basket.pair_key, self.config.lookback_window)
         if not candles:
             return
-        for ts, log_a, log_b in candles:
-            pair.prices_a.append(log_a)
-            pair.prices_b.append(log_b)
+        for ts, log_prices in candles:
+            if len(log_prices) != basket.basket_size:
+                continue  # Schema mismatch, skip
+            for i, lp in enumerate(log_prices):
+                basket.price_buffers[i].append(lp)
         # Set last_resample_time so the next candle flushes at the right time
-        pair.last_resample_time = candles[-1][0]
-        logger.info(f"Restored {len(candles)} candles for {pair.pair_key[:8]}..{pair.pair_key[-6:]} "
-                    f"(count={pair.prices_a.count})")
+        basket.last_resample_time = candles[-1][0]
+        logger.info(f"Restored {len(candles)} candles for {basket.pair_key[:16]}.. "
+                    f"(count={basket.price_buffers[0].count})")
 
-    def _update_pair(self, pair: PairState, price_a: float, price_b: float,
-                     slot: int, block_time: int) -> Optional[Signal]:
-        """Update pair with resampled candle-close prices.
+    def _update_basket(self, basket: BasketState, prices: List[float],
+                       slot: int, block_time: float) -> Optional[Signal]:
+        """Update basket with resampled candle-close prices.
 
-        Instead of appending every raw swap price (irregular intervals), we:
-        1. Cache the latest price as "pending"
-        2. Every signal_resample_secs, flush the pending price to the buffer
-        3. Compute z-score only from the resampled buffer
-
-        This matches the scanner's 5-min resampling timescale and eliminates
-        noise from irregular swap arrival rates.
+        Instead of appending every raw price (irregular intervals), we:
+        1. Cache the latest prices as "pending"
+        2. Every signal_resample_secs, flush the pending prices to the buffers
+        3. Compute z-score only from the resampled buffers
         """
         now = block_time or time.time()
 
-        # Always update pending (latest known price for this pair)
-        pair.pending_price_a = price_a
-        pair.pending_price_b = price_b
-        pair.last_update_slot = slot
+        # Always update pending (latest known prices for this basket)
+        basket.pending_prices = list(prices)
+        basket.last_update_slot = slot
 
         # Initialize resample timer on first observation
-        if pair.last_resample_time == 0:
-            pair.last_resample_time = now
+        if basket.last_resample_time == 0:
+            basket.last_resample_time = now
             return None
 
         # Check if it's time to flush a new candle
-        elapsed = now - pair.last_resample_time
+        elapsed = now - basket.last_resample_time
         if elapsed < self.config.signal_resample_secs:
             # Not time yet — but still compute live z-score for display
-            # using buffered history + current pending price
-            if pair.prices_a.count >= 2:
-                self._compute_zscore_live(pair)
+            if basket.price_buffers[0].count >= 2:
+                self._compute_zscore_live(basket)
             return None
 
-        # Time to resample: append the latest price as a candle close
-        log_a = np.log(pair.pending_price_a)
-        log_b = np.log(pair.pending_price_b)
-        pair.prices_a.append(log_a)
-        pair.prices_b.append(log_b)
-        pair.last_resample_time = now
+        # Time to resample: append the latest prices as candle close
+        log_prices = [np.log(p) for p in basket.pending_prices]
+        for i, lp in enumerate(log_prices):
+            basket.price_buffers[i].append(lp)
+        basket.last_resample_time = now
 
         # Persist candle to DB for warmup avoidance on restart
         if self.db:
-            self.db.save_candle(pair.pair_key, now, float(log_a), float(log_b))
+            self.db.save_candle(basket.pair_key, now, log_prices)
 
         # Need minimum observations for meaningful statistics
-        if pair.prices_a.count < 30:
+        if basket.price_buffers[0].count < 30:
             return None
 
-        # Compute spread and z-score from resampled buffer
-        arr_a = pair.prices_a.get_array()
-        arr_b = pair.prices_b.get_array()
-        spread = arr_a - pair.hedge_ratio * arr_b
+        # Compute spread and z-score from resampled buffers
+        # spread = sum(hedge_ratios[i] * log_prices[i]) for each time step
+        arrays = [buf.get_array() for buf in basket.price_buffers]
+        price_matrix = np.column_stack(arrays)  # (T, N)
+        hr = np.array(basket.hedge_ratios)       # (N,)
+        spread = price_matrix @ hr               # (T,)
 
-        pair.current_spread = float(spread[-1])
-        pair.spread_mean = float(np.mean(spread))
-        pair.spread_std = float(np.std(spread))
+        basket.current_spread = float(spread[-1])
+        basket.spread_mean = float(np.mean(spread))
+        basket.spread_std = float(np.std(spread))
 
-        if pair.spread_std < 1e-12:
-            pair.current_zscore = 0.0
+        if basket.spread_std < 1e-12:
+            basket.current_zscore = 0.0
             return None
 
-        pair.current_zscore = (pair.current_spread - pair.spread_mean) / pair.spread_std
+        basket.current_zscore = (basket.current_spread - basket.spread_mean) / basket.spread_std
 
         # Guard against degenerate z-scores from near-zero std
-        if abs(pair.current_zscore) > 100:
-            pair.current_zscore = 0.0
+        if abs(basket.current_zscore) > 100:
+            basket.current_zscore = 0.0
             return None
 
         # Check thresholds (only at resample boundaries)
-        signal_type = self._check_signal(pair)
+        signal_type = self._check_signal(basket)
         if signal_type is None:
             return None
 
         return Signal(
             signal_type=signal_type,
-            pair_key=pair.pair_key,
-            token_a_mint=pair.token_a_mint,
-            token_b_mint=pair.token_b_mint,
-            token_a_symbol=pair.token_a_symbol,
-            token_b_symbol=pair.token_b_symbol,
-            zscore=pair.current_zscore,
-            hedge_ratio=pair.hedge_ratio,
-            spread=pair.current_spread,
-            spread_mean=pair.spread_mean,
-            spread_std=pair.spread_std,
-            timestamp=block_time or int(time.time()),
+            pair_key=basket.pair_key,
+            basket_size=basket.basket_size,
+            mints=basket.mints,
+            symbols=basket.symbols,
+            hedge_ratios=basket.hedge_ratios,
+            zscore=basket.current_zscore,
+            spread=basket.current_spread,
+            spread_mean=basket.spread_mean,
+            spread_std=basket.spread_std,
+            timestamp=int(block_time) if block_time else int(time.time()),
             slot=slot,
         )
 
-    def _compute_zscore_live(self, pair: PairState):
-        """Compute a live z-score for display (using buffer + pending price).
+    def _compute_zscore_live(self, basket: BasketState):
+        """Compute a live z-score for display (using buffer + pending prices).
         Does NOT trigger signals — just updates the dashboard display."""
-        if pair.pending_price_a <= 0 or pair.pending_price_b <= 0:
+        if any(p <= 0 for p in basket.pending_prices):
             return
-        arr_a = pair.prices_a.get_array()
-        arr_b = pair.prices_b.get_array()
-        if len(arr_a) < 2:
+        arrays = [buf.get_array() for buf in basket.price_buffers]
+        if len(arrays[0]) < 2:
             return
-        spread = arr_a - pair.hedge_ratio * arr_b
+        price_matrix = np.column_stack(arrays)
+        hr = np.array(basket.hedge_ratios)
+        spread = price_matrix @ hr
         mean = float(np.mean(spread))
         std = float(np.std(spread))
         if std < 1e-12:
             return
         # Current spread using pending (live) prices
-        live_spread = np.log(pair.pending_price_a) - pair.hedge_ratio * np.log(pair.pending_price_b)
+        live_log_prices = np.array([np.log(p) for p in basket.pending_prices])
+        live_spread = float(live_log_prices @ hr)
         z = (live_spread - mean) / std
         if abs(z) > 100:
             return  # degenerate — don't display garbage
-        pair.current_zscore = z
-        pair.current_spread = float(live_spread)
+        basket.current_zscore = z
+        basket.current_spread = live_spread
 
-    def _check_signal(self, pair: PairState) -> Optional[SignalType]:
-        z = pair.current_zscore
+    def _check_signal(self, basket: BasketState) -> Optional[SignalType]:
+        z = basket.current_zscore
 
         if abs(z) > self.config.stop_loss_zscore:
-            if pair.in_position:
+            if basket.in_position:
                 return SignalType.STOP_LOSS
-            # z beyond stop-loss but no position — don't enter (too extreme)
             return None
         elif z < -self.config.entry_zscore:
-            if not pair.in_position:
+            if not basket.in_position:
                 return SignalType.ENTRY_LONG
         elif z > self.config.entry_zscore:
-            if not pair.in_position:
+            if not basket.in_position:
                 return SignalType.ENTRY_SHORT
         elif abs(z) < self.config.exit_zscore:
-            if pair.in_position:
-                # Enforce cooldown: don't exit too soon after entry
-                # entry_cooldown_slots / 2.5 blk/s ≈ seconds
+            if basket.in_position:
                 cooldown_secs = self.config.entry_cooldown_slots / 2.5
-                if (time.time() - pair.position_entry_time) >= cooldown_secs:
+                if (time.time() - basket.position_entry_time) >= cooldown_secs:
                     return SignalType.EXIT
         return None
 
-    def get_pair_states(self) -> Dict[str, PairState]:
-        return self.pairs
+    def get_basket_states(self) -> Dict[str, BasketState]:
+        return self.baskets
+
+    # Backward compat alias
+    def get_pair_states(self) -> Dict[str, BasketState]:
+        return self.baskets

@@ -3,6 +3,7 @@ Portfolio manager for statalayer.
 Tracks open positions, marks-to-market, computes P&L, persists state.
 """
 
+import json
 import logging
 import time
 from dataclasses import dataclass, field
@@ -20,32 +21,23 @@ class PositionStatus(Enum):
 
 @dataclass
 class Position:
-    pair_key: str
-    token_a_mint: str
-    token_b_mint: str
-    direction: str  # "long" or "short" (refers to the spread)
+    pair_key: str             # basket key
+    basket_size: int
+    mints: List[str]          # sorted token mints
+    direction: str            # "long" or "short" (refers to the spread)
+    hedge_ratios: List[float] # Johansen eigenvector weights (length N)
 
     # Entry state
     entry_time: int
     entry_slot: int
     entry_zscore: float
-    entry_price_a: float
-    entry_price_b: float
-    hedge_ratio: float
-
-    # Quantities (always positive, direction encodes long/short)
-    quantity_a: float
-    quantity_b: float
-    quantity_a_raw: int
-    quantity_b_raw: int
-
-    # Dollar values at entry
-    entry_value_a: float
-    entry_value_b: float
+    entry_prices: List[float]    # USD price per token at entry
+    quantities: List[float]      # human-readable amount per token
+    quantities_raw: List[int]    # raw lamports/units per token
+    entry_values: List[float]    # USD value per leg at entry
 
     # Current state
-    current_price_a: float = 0.0
-    current_price_b: float = 0.0
+    current_prices: List[float] = field(default_factory=list)
     current_zscore: float = 0.0
     unrealized_pnl: float = 0.0
 
@@ -53,8 +45,7 @@ class Position:
     exit_time: Optional[int] = None
     exit_slot: Optional[int] = None
     exit_zscore: Optional[float] = None
-    exit_price_a: Optional[float] = None
-    exit_price_b: Optional[float] = None
+    exit_prices: Optional[List[float]] = None
     realized_pnl: float = 0.0
 
     status: PositionStatus = PositionStatus.OPEN
@@ -78,7 +69,6 @@ class PortfolioManager:
 
     def _load_state(self):
         """Load state from DB for crash recovery."""
-        # Load initial capital and peak from config_state
         saved_capital = self.db.get_state('initial_capital')
         if saved_capital:
             self.initial_capital = float(saved_capital)
@@ -87,7 +77,6 @@ class PortfolioManager:
         if saved_peak:
             self.peak_value = float(saved_peak)
         else:
-            # No saved peak — set to current capital (not config default)
             self.peak_value = self.initial_capital
 
         saved_pnl = self.db.get_state('total_realized_pnl')
@@ -100,23 +89,27 @@ class PortfolioManager:
 
         for row in rows:
             data = dict(zip(columns, row))
+            mints = json.loads(data['mints_json'])
+            hedge_ratios = json.loads(data['hedge_ratios_json'])
+            entry_prices = json.loads(data['entry_prices_json'])
+            quantities = json.loads(data['quantities_json'])
+            quantities_raw = json.loads(data['quantities_raw_json'])
+            entry_values = json.loads(data['entry_values_json'])
+
             position = Position(
                 pair_key=data['pair_key'],
-                token_a_mint=data['token_a_mint'],
-                token_b_mint=data['token_b_mint'],
+                basket_size=data['basket_size'],
+                mints=mints,
                 direction=data['direction'],
+                hedge_ratios=hedge_ratios,
                 entry_time=data['entry_time'],
                 entry_slot=data['entry_slot'],
                 entry_zscore=data['entry_zscore'],
-                entry_price_a=data['entry_price_a'],
-                entry_price_b=data['entry_price_b'],
-                hedge_ratio=data['hedge_ratio'],
-                quantity_a=data['quantity_a'],
-                quantity_b=data['quantity_b'],
-                quantity_a_raw=data['quantity_a_raw'],
-                quantity_b_raw=data['quantity_b_raw'],
-                entry_value_a=data['entry_value_a'],
-                entry_value_b=data['entry_value_b'],
+                entry_prices=entry_prices,
+                quantities=quantities,
+                quantities_raw=quantities_raw,
+                entry_values=entry_values,
+                current_prices=list(entry_prices),  # init to entry prices
                 status=PositionStatus.OPEN,
                 is_paper=bool(data['is_paper']),
                 id=data['id'],
@@ -127,39 +120,34 @@ class PortfolioManager:
             logger.info(f"Recovered {len(self.positions)} open positions from DB")
 
     def open_position(self, signal, size, is_paper: bool = True,
-                      price_a: float = 0.0, price_b: float = 0.0,
+                      prices: List[float] = None,
                       fees_usd: float = 0.0) -> Position:
         """Create a new position from a signal and size."""
         direction = "long" if signal.signal_type.value == "entry_long" else "short"
 
         position = Position(
             pair_key=signal.pair_key,
-            token_a_mint=signal.token_a_mint,
-            token_b_mint=signal.token_b_mint,
+            basket_size=signal.basket_size,
+            mints=signal.mints,
             direction=direction,
+            hedge_ratios=signal.hedge_ratios,
             entry_time=signal.timestamp,
             entry_slot=signal.slot,
             entry_zscore=signal.zscore,
-            entry_price_a=price_a,
-            entry_price_b=price_b,
-            hedge_ratio=signal.hedge_ratio,
-            quantity_a=size.token_a_amount,
-            quantity_b=size.token_b_amount,
-            quantity_a_raw=size.token_a_raw,
-            quantity_b_raw=size.token_b_raw,
-            entry_value_a=size.dollar_amount_a,
-            entry_value_b=size.dollar_amount_b,
+            entry_prices=prices if prices else [0.0] * signal.basket_size,
+            quantities=size.amounts,
+            quantities_raw=size.amounts_raw,
+            entry_values=size.dollar_amounts,
             is_paper=is_paper,
         )
-        position.current_price_a = position.entry_price_a
-        position.current_price_b = position.entry_price_b
+        position.current_prices = list(position.entry_prices)
         position.fees_usd = fees_usd
 
         # Persist immediately
         self.db.save_position(position)
         self.positions[position.pair_key] = position
 
-        logger.info(f"Opened {direction} position: {signal.pair_key} "
+        logger.info(f"Opened {direction} position: {signal.pair_key[:16]}.. "
                      f"z={signal.zscore:+.2f} "
                      f"${size.total_exposure_usd:.0f} exposure")
         return position
@@ -175,27 +163,27 @@ class PortfolioManager:
         position.exit_time = int(time.time())
         position.exit_slot = exit_slot
         position.exit_zscore = exit_zscore
-        position.exit_price_a = position.current_price_a
-        position.exit_price_b = position.current_price_b
+        position.exit_prices = list(position.current_prices)
 
-        # Compute realized P&L
-        if position.direction == "long":
-            # Long spread: bought A, sold B
-            pnl_a = (position.current_price_a - position.entry_price_a) * position.quantity_a
-            pnl_b = (position.entry_price_b - position.current_price_b) * position.quantity_b
-        else:
-            # Short spread: sold A, bought B
-            pnl_a = (position.entry_price_a - position.current_price_a) * position.quantity_a
-            pnl_b = (position.current_price_b - position.entry_price_b) * position.quantity_b
+        # Compute realized P&L per leg
+        pnl = 0.0
+        for i in range(position.basket_size):
+            signed_hr = position.hedge_ratios[i] if position.direction == "long" else -position.hedge_ratios[i]
+            if signed_hr > 0:
+                # Bought this token
+                pnl += (position.current_prices[i] - position.entry_prices[i]) * position.quantities[i]
+            else:
+                # Sold this token
+                pnl += (position.entry_prices[i] - position.current_prices[i]) * position.quantities[i]
 
-        position.realized_pnl = pnl_a + pnl_b
+        position.realized_pnl = pnl
 
-        # Deduct transaction fees (entry fees already stored, add exit fees)
+        # Deduct transaction fees
         position.fees_usd += exit_fees_usd
         position.realized_pnl -= position.fees_usd
 
-        # Sanity cap: a pair trade can't lose more than its total entry value
-        entry_value = position.entry_value_a + position.entry_value_b
+        # Sanity cap: can't lose more than total entry value
+        entry_value = sum(position.entry_values)
         if entry_value > 0 and position.realized_pnl < -entry_value:
             logger.warning(f"P&L ${position.realized_pnl:+.2f} exceeds entry value ${entry_value:.2f} — "
                            f"capping to -${entry_value:.2f} (price data error)")
@@ -207,8 +195,7 @@ class PortfolioManager:
         self.total_realized_pnl += position.realized_pnl
         self.db.set_state('total_realized_pnl', str(self.total_realized_pnl))
 
-        # Compound reinvest: fold all realized P&L into capital base
-        # (total_realized_pnl is kept for reporting only; get_total_value uses initial_capital)
+        # Compound reinvest
         self.initial_capital += position.realized_pnl
         self.db.set_state('initial_capital', str(self.initial_capital))
         if position.realized_pnl >= 0:
@@ -221,7 +208,7 @@ class PortfolioManager:
         del self.positions[pair_key]
         self.closed_positions.append(position)
 
-        logger.info(f"Closed {position.direction} {pair_key} ({reason}): "
+        logger.info(f"Closed {position.direction} {pair_key[:16]}.. ({reason}): "
                      f"P&L ${position.realized_pnl:+.2f}"
                      f"{f' (fees: ${position.fees_usd:.4f})' if position.fees_usd > 0 else ''}")
         return position
@@ -229,23 +216,21 @@ class PortfolioManager:
     def mark_to_market(self, prices: Dict[str, float]):
         """Update all open positions with latest prices."""
         for position in self.positions.values():
-            price_a = prices.get(position.token_a_mint)
-            price_b = prices.get(position.token_b_mint)
-
-            if price_a:
-                position.current_price_a = price_a
-            if price_b:
-                position.current_price_b = price_b
+            for i, mint in enumerate(position.mints):
+                p = prices.get(mint)
+                if p and p > 0:
+                    position.current_prices[i] = p
 
             # Compute unrealized P&L
-            if position.direction == "long":
-                pnl_a = (position.current_price_a - position.entry_price_a) * position.quantity_a
-                pnl_b = (position.entry_price_b - position.current_price_b) * position.quantity_b
-            else:
-                pnl_a = (position.entry_price_a - position.current_price_a) * position.quantity_a
-                pnl_b = (position.current_price_b - position.entry_price_b) * position.quantity_b
+            pnl = 0.0
+            for i in range(position.basket_size):
+                signed_hr = position.hedge_ratios[i] if position.direction == "long" else -position.hedge_ratios[i]
+                if signed_hr > 0:
+                    pnl += (position.current_prices[i] - position.entry_prices[i]) * position.quantities[i]
+                else:
+                    pnl += (position.entry_prices[i] - position.current_prices[i]) * position.quantities[i]
 
-            position.unrealized_pnl = pnl_a + pnl_b
+            position.unrealized_pnl = pnl
 
         # Update peak value
         total = self.get_total_value()
@@ -256,15 +241,14 @@ class PortfolioManager:
     def get_total_exposure(self) -> float:
         total = 0.0
         for p in self.positions.values():
-            total += abs(p.current_price_a * p.quantity_a)
-            total += abs(p.current_price_b * p.quantity_b)
+            for i in range(p.basket_size):
+                total += abs(p.current_prices[i] * p.quantities[i])
         return total
 
     def get_total_unrealized_pnl(self) -> float:
         return sum(p.unrealized_pnl for p in self.positions.values())
 
     def get_total_value(self) -> float:
-        # initial_capital includes all compounded realized P&L
         return self.initial_capital + self.get_total_unrealized_pnl()
 
     def get_drawdown(self) -> float:
@@ -290,7 +274,6 @@ class PortfolioManager:
     def save_capital(self):
         """Persist initial capital to DB and ensure peak_value is consistent."""
         self.db.set_state('initial_capital', str(self.initial_capital))
-        # If peak is below current capital (e.g. --capital override), reset it
         current_value = self.get_total_value()
         if current_value > self.peak_value:
             self.peak_value = current_value

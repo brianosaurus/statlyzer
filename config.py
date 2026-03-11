@@ -31,8 +31,9 @@ class Config:
     # Signal thresholds
     entry_zscore: float = float(os.getenv('ENTRY_ZSCORE', '2.5'))
     exit_zscore: float = float(os.getenv('EXIT_ZSCORE', '0.5'))
-    stop_loss_zscore: float = float(os.getenv('STOP_LOSS_ZSCORE', '5.0'))
-    max_entry_zscore: float = float(os.getenv('MAX_ENTRY_ZSCORE', '5.0'))
+    stop_loss_zscore: float = float(os.getenv('STOP_LOSS_ZSCORE', '4.0'))
+    max_entry_zscore: float = float(os.getenv('MAX_ENTRY_ZSCORE', '3.0'))
+    allowed_direction: str = os.getenv('ALLOWED_DIRECTION', 'both')  # both, long, short
 
     # Position sizing
     sizing_method: str = os.getenv('SIZING_METHOD', 'fixed_fraction')
@@ -49,7 +50,7 @@ class Config:
     pair_staleness_hours: int = int(os.getenv('PAIR_STALENESS_HOURS', '24'))
     min_half_life: float = float(os.getenv('MIN_HALF_LIFE', '200'))
     max_half_life_ratio: float = float(os.getenv('MAX_HALF_LIFE_RATIO', '0.5'))
-    max_positions_per_token: int = int(os.getenv('MAX_POSITIONS_PER_TOKEN', '5'))
+    max_positions_per_token: int = int(os.getenv('MAX_POSITIONS_PER_TOKEN', '3'))
 
     # Execution
     slippage_bps: int = int(os.getenv('SLIPPAGE_BPS', '50'))

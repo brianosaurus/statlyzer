@@ -7,8 +7,13 @@ import time
 from typing import Dict, List
 
 
+def basket_label(symbols: List[str]) -> str:
+    return "/".join(symbols)
+
+
+# Backward compat alias
 def token_label(symbol_a: str, symbol_b: str) -> str:
-    return f"{symbol_a}/{symbol_b}"
+    return basket_label([symbol_a, symbol_b])
 
 
 def print_banner(config, num_pairs: int, mode: str):
@@ -22,7 +27,7 @@ def print_banner(config, num_pairs: int, mode: str):
         print(f"  Scanner DB:      {config.scanner_db_path}")
     else:
         print(f"  Discovery:       inline (warmup {config.coint_warmup_minutes:.0f}min)")
-    print(f"  Pairs loaded:    {num_pairs}")
+    print(f"  Baskets loaded:  {num_pairs}")
     print(f"  Initial capital: ${config.initial_capital:,.0f}")
     print(f"  Entry z-score:   {config.entry_zscore}")
     print(f"  Exit z-score:    {config.exit_zscore}")
@@ -37,7 +42,7 @@ def print_banner(config, num_pairs: int, mode: str):
 def print_signal(signal, risk_result):
     """Print a signal alert with risk check result."""
     z_str = f"z={signal.zscore:+.3f}"
-    pair_label = token_label(signal.token_a_symbol, signal.token_b_symbol)
+    label = basket_label(signal.symbols)
 
     if risk_result.allowed:
         status = "PASS"
@@ -45,66 +50,65 @@ def print_signal(signal, risk_result):
         status = f"BLOCKED: {risk_result.reason}"
 
     sig_type = signal.signal_type.value.upper().replace('_', ' ')
-    # Clear progress line (\r) before printing signal on its own line
     sys.stdout.write('\n')
-    print(f"  [{sig_type}] {pair_label}  {z_str}  | {status}")
+    print(f"  [{sig_type}] {label}  {z_str}  | {status}")
 
 
 def print_entry(signal, position, execution):
     """Print when a new position is opened."""
-    pair_label = token_label(signal.token_a_symbol, signal.token_b_symbol)
+    label = basket_label(signal.symbols)
     direction = position.direction.upper()
-    exposure = position.entry_value_a + position.entry_value_b
-    slip_a = execution.fill_a.slippage_bps
-    slip_b = execution.fill_b.slippage_bps
-    print(f"  >>> OPEN {direction} {pair_label}  z={signal.zscore:+.3f}  "
-          f"${exposure:.0f} exposure  slip={slip_a:.0f}/{slip_b:.0f}bps")
+    exposure = sum(position.entry_values)
+    slips = [f"{f.slippage_bps:.0f}" for f in execution.fills]
+    slip_str = "/".join(slips) + "bps"
+    print(f"  >>> OPEN {direction} {label}  z={signal.zscore:+.3f}  "
+          f"${exposure:.0f} exposure  slip={slip_str}")
 
 
 def print_exit(position, reason: str):
     """Print when a position is closed."""
-    pair_label = f"{position.token_a_mint[:6]}../{position.token_b_mint[:6]}.."
+    mints_short = "/".join(m[:6] + ".." for m in position.mints)
     pnl = position.realized_pnl
     pnl_str = f"${pnl:+.2f}"
     fees_str = f" (fees: ${position.fees_usd:.4f})" if position.fees_usd > 0 else ""
     duration = (position.exit_time - position.entry_time) if position.exit_time else 0
-    print(f"  <<< CLOSE {position.direction.upper()} {pair_label}  "
+    print(f"  <<< CLOSE {position.direction.upper()} {mints_short}  "
           f"P&L {pnl_str}{fees_str}  ({reason}, {duration}s)")
 
 
 def print_positions(positions: Dict, portfolio_value: float):
     """Print open positions table."""
     if positions:
-        print(f"\n  {'Pair':<20} {'Dir':<6} {'Entry Z':>8} {'Curr Z':>8} {'Unrl P&L':>10} {'Exposure':>10}")
-        print(f"  {'-'*20} {'-'*6} {'-'*8} {'-'*8} {'-'*10} {'-'*10}")
+        print(f"\n  {'Basket':<24} {'Dir':<6} {'Entry Z':>8} {'Curr Z':>8} {'Unrl P&L':>10} {'Exposure':>10}")
+        print(f"  {'-'*24} {'-'*6} {'-'*8} {'-'*8} {'-'*10} {'-'*10}")
 
         for pair_key, pos in positions.items():
             pair_short = pair_key[:8] + '..' + pair_key[-6:]
-            exposure = abs(pos.current_price_a * pos.quantity_a) + abs(pos.current_price_b * pos.quantity_b)
-            print(f"  {pair_short:<20} {pos.direction:<6} {pos.entry_zscore:>+8.3f} "
+            exposure = sum(abs(pos.current_prices[i] * pos.quantities[i])
+                          for i in range(pos.basket_size))
+            print(f"  {pair_short:<24} {pos.direction:<6} {pos.entry_zscore:>+8.3f} "
                   f"{pos.current_zscore:>+8.3f} {pos.unrealized_pnl:>+10.2f} {exposure:>10.0f}")
 
     print(f"\n  Portfolio value: ${portfolio_value:,.2f}")
 
 
-def print_zscore_dashboard(pair_states: Dict, max_rows: int = 10):
-    """Print z-score summary for monitored pairs (throttled)."""
-    # Sort by abs z-score descending
-    active = [(k, p) for k, p in pair_states.items() if p.prices_a.count > 0]
+def print_zscore_dashboard(basket_states: Dict, max_rows: int = 10):
+    """Print z-score summary for monitored baskets (throttled)."""
+    active = [(k, b) for k, b in basket_states.items() if b.price_buffers[0].count > 0]
     active.sort(key=lambda x: abs(x[1].current_zscore), reverse=True)
 
     if not active:
         return
 
-    print(f"\n  {'Pair':<24} {'Z-score':>8} {'Spread':>10} {'Obs':>5}")
-    print(f"  {'-'*24} {'-'*8} {'-'*10} {'-'*5}")
+    print(f"\n  {'Basket':<28} {'Z-score':>8} {'Spread':>10} {'Obs':>5}")
+    print(f"  {'-'*28} {'-'*8} {'-'*10} {'-'*5}")
 
-    for pair_key, pair in active[:max_rows]:
-        label = f"{pair.token_a_symbol}/{pair.token_b_symbol}"
-        print(f"  {label:<24} {pair.current_zscore:>+8.3f} {pair.current_spread:>10.6f} {pair.prices_a.count:>5}")
+    for pair_key, bsk in active[:max_rows]:
+        label = basket_label(bsk.symbols)
+        print(f"  {label:<28} {bsk.current_zscore:>+8.3f} {bsk.current_spread:>10.6f} {bsk.price_buffers[0].count:>5}")
 
     if len(active) > max_rows:
-        print(f"  ... and {len(active) - max_rows} more pairs")
+        print(f"  ... and {len(active) - max_rows} more baskets")
 
 
 def print_progress(polls: int, num_prices: int, signals: int, trades: int, start_time: float):

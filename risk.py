@@ -61,15 +61,13 @@ class RiskManager:
         # 3b. Concentration limit — max positions sharing a token
         # Exempt stablecoins (USDC etc.) since they're the quote currency for every pair
         from constants import STABLECOIN_MINTS
-        mint_a = signal.token_a_mint
-        mint_b = signal.token_b_mint
         max_per_token = self.config.max_positions_per_token
-        for mint in (mint_a, mint_b):
+        for mint in signal.mints:
             if mint in STABLECOIN_MINTS:
                 continue
             count = sum(
                 1 for p in self.portfolio.positions.values()
-                if p.token_a_mint == mint or p.token_b_mint == mint
+                if mint in p.mints
             )
             if count >= max_per_token:
                 return RiskCheck(False, f"Concentration limit ({max_per_token}) for {mint[:8]}.. reached")
