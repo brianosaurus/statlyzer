@@ -27,6 +27,7 @@ class JupiterPriceFeed:
         self.mints.add(SOL_MINT)  # always need SOL/USD
         self.sol_usd_price: float = 0.0
         self._api_key = os.getenv('JUPITER_API_KEY', '')
+        self._last_prices: Dict[str, float] = {}  # cached fallback for API outages
 
     def update_mints(self, new_mints: Set[str]):
         """Add mints to the poll set (e.g. when discovery finds new pairs)."""
@@ -40,10 +41,11 @@ class JupiterPriceFeed:
                 None, self._fetch_prices
             )
             if prices:
+                self._last_prices = prices
                 yield prices
             else:
-                logger.warning("Jupiter price poll returned no prices")
-                yield {}
+                logger.warning("Jupiter price poll failed, using cached prices")
+                yield self._last_prices
             await asyncio.sleep(self.config.price_poll_interval)
 
     def _fetch_prices(self) -> Dict[str, float]:

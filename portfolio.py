@@ -65,6 +65,7 @@ class PortfolioManager:
         self.initial_capital: float = config.initial_capital
         self.total_realized_pnl: float = 0.0
         self.peak_value: float = config.initial_capital
+        self._wallet_synced_value: Optional[float] = None  # actual on-chain wallet value
         self._load_state()
 
     def _load_state(self):
@@ -195,13 +196,14 @@ class PortfolioManager:
         self.total_realized_pnl += position.realized_pnl
         self.db.set_state('total_realized_pnl', str(self.total_realized_pnl))
 
-        # Compound reinvest
-        self.initial_capital += position.realized_pnl
-        self.db.set_state('initial_capital', str(self.initial_capital))
+        # Compound reinvest — skip if wallet-synced (next sync picks up actual balance)
+        if self._wallet_synced_value is None:
+            self.initial_capital += position.realized_pnl
+            self.db.set_state('initial_capital', str(self.initial_capital))
         if position.realized_pnl >= 0:
-            logger.info(f"Compounded +${position.realized_pnl:.2f} → capital now ${self.initial_capital:.2f}")
+            logger.info(f"Closed P&L +${position.realized_pnl:.2f} → capital ${self.initial_capital:.2f}")
         else:
-            logger.info(f"Compounded ${position.realized_pnl:.2f} → capital now ${self.initial_capital:.2f}")
+            logger.info(f"Closed P&L ${position.realized_pnl:.2f} → capital ${self.initial_capital:.2f}")
 
         # Persist
         self.db.update_position(position)
@@ -249,13 +251,19 @@ class PortfolioManager:
         return sum(p.unrealized_pnl for p in self.positions.values())
 
     def get_total_value(self) -> float:
+        # In live mode with wallet sync, use the actual on-chain wallet value.
+        # The computed initial_capital + unrealized_pnl double-counts because
+        # sync_wallet_capital already includes position token values.
+        if self._wallet_synced_value is not None:
+            return self._wallet_synced_value
         return self.initial_capital + self.get_total_unrealized_pnl()
 
     def get_drawdown(self) -> float:
-        """Drawdown based on realized capital only (ignores unrealized P&L)."""
+        """Drawdown from peak wallet value."""
         if self.peak_value <= 0:
             return 0.0
-        return (self.peak_value - self.initial_capital) / self.peak_value
+        current = self._wallet_synced_value if self._wallet_synced_value is not None else self.initial_capital
+        return max(0.0, (self.peak_value - current) / self.peak_value)
 
     def has_position(self, pair_key: str) -> bool:
         return pair_key in self.positions
@@ -270,6 +278,58 @@ class PortfolioManager:
             unrealized_pnl=self.get_total_unrealized_pnl(),
             drawdown_pct=self.get_drawdown(),
         )
+
+    def sync_wallet_capital(self, sol_balance: float, sol_usd_price: float,
+                            token_balances: list = None, token_prices: dict = None):
+        """Sync capital from actual on-chain wallet value.
+
+        Sets initial_capital to SOL value only (free cash not in positions).
+        Sets _wallet_synced_value to full wallet value (SOL + position tokens,
+        excluding orphans) for accurate portfolio value display.
+
+        Args:
+            sol_balance: SOL balance in SOL units
+            sol_usd_price: current SOL/USD price
+            token_balances: list of (mint, ui_amount) for non-SOL tokens
+            token_prices: {mint: usd_price} from price feed
+        """
+        if sol_usd_price <= 0:
+            return
+        sol_usd = sol_balance * sol_usd_price
+
+        # Separate position tokens from orphans
+        position_mints = set()
+        for pos in self.positions.values():
+            position_mints.update(pos.mints)
+
+        position_token_value = 0.0
+        orphan_value = 0.0
+        if token_balances and token_prices:
+            for mint, ui_amount in token_balances:
+                price = token_prices.get(mint, 0)
+                if price > 0 and ui_amount > 0:
+                    if mint in position_mints:
+                        position_token_value += ui_amount * price
+                    else:
+                        orphan_value += ui_amount * price
+
+        # initial_capital = SOL only (free cash for sizing new positions)
+        old_capital = self.initial_capital
+        self.initial_capital = sol_usd
+        self.db.set_state('initial_capital', str(self.initial_capital))
+
+        # Wallet-synced total = SOL + position tokens (excludes orphans)
+        self._wallet_synced_value = sol_usd + position_token_value
+
+        # Update peak based on total wallet value
+        if self._wallet_synced_value > self.peak_value:
+            self.peak_value = self._wallet_synced_value
+            self.db.set_state('peak_value', str(self.peak_value))
+
+        if abs(old_capital - self.initial_capital) > 0.01:
+            logger.debug(f"Capital synced: SOL=${sol_usd:.2f} tokens=${position_token_value:.2f} "
+                         f"total=${self._wallet_synced_value:.2f}"
+                         f"{f' [orphans: ${orphan_value:.2f} excluded]' if orphan_value > 0.01 else ''}")
 
     def save_capital(self):
         """Persist initial capital to DB and ensure peak_value is consistent."""

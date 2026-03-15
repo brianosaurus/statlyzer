@@ -61,6 +61,12 @@ class Config:
     lunar_lander_endpoint: str = os.getenv('LUNAR_LANDER_ENDPOINT', 'http://fra.lunar-lander.hellomoon.io')
     lunar_lander_api_key: str = os.getenv('LUNAR_LANDER_API_KEY', '')
 
+    # Paper realism (make paper trading mirror live)
+    paper_leg_failure_pct: float = float(os.getenv('PAPER_LEG_FAILURE_PCT', '0.07'))  # 7% chance per leg fails
+    paper_latency_mean_s: float = float(os.getenv('PAPER_LATENCY_MEAN_S', '15'))     # mean execution latency
+    paper_latency_std_s: float = float(os.getenv('PAPER_LATENCY_STD_S', '8'))        # stddev of latency
+    paper_qty_jitter_pct: float = float(os.getenv('PAPER_QTY_JITTER_PCT', '0.01'))   # 1% fill quantity jitter
+
     # Price feed
     price_poll_interval: float = float(os.getenv('PRICE_POLL_INTERVAL', '6'))
 

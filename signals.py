@@ -405,8 +405,26 @@ class SignalGenerator:
         elapsed = now - basket.last_resample_time
         if elapsed < self.config.signal_resample_secs:
             # Not time yet — but still compute live z-score for display
+            # AND check for exit/stop signals on every tick (don't wait for candle close)
             if basket.price_buffers[0].count >= 2:
                 self._compute_zscore_live(basket)
+                if basket.in_position:
+                    signal_type = self._check_signal(basket)
+                    if signal_type in (SignalType.EXIT, SignalType.STOP_LOSS):
+                        return Signal(
+                            signal_type=signal_type,
+                            pair_key=basket.pair_key,
+                            basket_size=basket.basket_size,
+                            mints=basket.mints,
+                            symbols=basket.symbols,
+                            hedge_ratios=basket.hedge_ratios,
+                            zscore=basket.current_zscore,
+                            spread=basket.current_spread,
+                            spread_mean=basket.spread_mean,
+                            spread_std=basket.spread_std,
+                            timestamp=int(block_time) if block_time else int(time.time()),
+                            slot=slot,
+                        )
             return None
 
         # Time to resample: append the latest prices as candle close
@@ -466,8 +484,9 @@ class SignalGenerator:
         )
 
     def _compute_zscore_live(self, basket: BasketState):
-        """Compute a live z-score for display (using buffer + pending prices).
-        Does NOT trigger signals — just updates the dashboard display."""
+        """Compute a live z-score using buffer + pending (tick-level) prices.
+        Updates basket.current_zscore and basket.current_spread.
+        Exit/stop signals are checked against this live z-score between resamples."""
         if any(p <= 0 for p in basket.pending_prices):
             return
         arrays = [buf.get_array() for buf in basket.price_buffers]

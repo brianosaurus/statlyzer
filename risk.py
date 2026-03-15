@@ -72,6 +72,11 @@ class RiskManager:
             if count >= max_per_token:
                 return RiskCheck(False, f"Concentration limit ({max_per_token}) for {mint[:8]}.. reached")
 
+        # 3c. Rate limit — max entries per hour
+        self._prune_entries()
+        if len(self.entries_this_hour) >= self.config.max_positions_per_hour:
+            return RiskCheck(False, f"Rate limit ({self.config.max_positions_per_hour}/hr) reached")
+
         # 4. Max exposure (scales with portfolio capital)
         exposure = self.portfolio.get_total_exposure()
         max_exposure = self.portfolio.initial_capital * self.config.max_exposure_ratio

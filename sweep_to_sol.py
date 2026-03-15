@@ -370,10 +370,10 @@ def execute_bundle(sweep_targets, keypair, pubkey, rpc_endpoint, quote_url, swap
 
 
 def main():
-    from dotenv import load_dotenv
     try:
+        from dotenv import load_dotenv
         load_dotenv()
-    except Exception:
+    except ImportError:
         pass
 
     parser = argparse.ArgumentParser(description="Sweep non-SOL tokens back to SOL")

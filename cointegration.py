@@ -187,7 +187,13 @@ class CointegrationDiscovery:
                        ) -> Tuple[float, float, float, np.ndarray]:
         """Engle-Granger two-step cointegration test.
         Returns: (adf_stat, p_value, hedge_ratio, spread)"""
+        # Reject constant series — OLS needs variance in both regressand and regressor
+        if np.ptp(log_a) == 0 or np.ptp(log_b) == 0:
+            raise ValueError("constant series")
+
         X = self._add_constant(log_b)
+        if X.ndim == 1 or X.shape[1] < 2:
+            raise ValueError("add_constant produced no regressor column")
         model = self._OLS(log_a, X).fit()
         hedge_ratio = model.params[1]
 

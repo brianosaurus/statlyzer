@@ -229,12 +229,21 @@ async def run_monitor(config: Config, args):
         to_close = [pk for pk, pos in portfolio.positions.items()
                     if pos.direction == unwanted]
         if to_close:
+            # Fetch live prices before force-closing (don't use stale entry prices)
+            _prefetch_feed = JupiterPriceFeed(config, signal_gen.all_mints())
+            _prefetch_prices = _prefetch_feed._fetch_prices()
+
             print(f"  Closing {len(to_close)} {unwanted} positions (direction filter)...")
             for pair_key in to_close:
                 pos = portfolio.positions[pair_key]
-                # Use entry prices as fallback (no live prices yet)
-                exit_prices = list(pos.entry_prices)
-                execution = await executor.execute_exit(pos, exit_prices)
+                exit_prices = [_prefetch_prices.get(m, pos.current_prices[i])
+                               for i, m in enumerate(pos.mints)]
+                other_mints = {m for pk, p in portfolio.positions.items() if pk != pair_key for m in p.mints}
+                try:
+                    execution = await executor.execute_exit(pos, exit_prices, other_position_mints=other_mints)
+                except Exception as e:
+                    logger.error(f"direction_filter exit failed for {pair_key}: {e} — position kept open")
+                    continue
                 for i, fill in enumerate(execution.fills):
                     pos.current_prices[i] = fill.price
                 closed = portfolio.close_position(pair_key, 0.0, 0, "direction_filter",
@@ -252,6 +261,63 @@ async def run_monitor(config: Config, args):
 
     # Initialize Jupiter price feed
     feed = JupiterPriceFeed(config, signal_gen.all_mints())
+
+    # Live mode: also track wallet token mints so we can price them
+    if not config.paper_trade and hasattr(executor, 'get_all_token_balances_sync'):
+        try:
+            wallet_tokens = executor.get_all_token_balances_sync()
+            wallet_mints = {mint for mint, _ in wallet_tokens}
+            feed.update_mints(wallet_mints)
+        except Exception:
+            pass
+
+    # Live mode: sweep orphaned tokens not belonging to any open position
+    if not config.paper_trade and hasattr(executor, 'get_all_token_balances_sync'):
+        try:
+            wallet_tokens = executor.get_all_token_balances_sync()
+            # Collect mints that belong to open positions
+            position_mints = set()
+            for pos in portfolio.positions.values():
+                position_mints.update(pos.mints)
+            # Identify orphans
+            orphans = [(mint, amt) for mint, amt in wallet_tokens if mint not in position_mints]
+            if orphans:
+                from constants import WELL_KNOWN_TOKENS
+                print(f"  Sweeping {len(orphans)} orphaned token(s) back to SOL...")
+                # Get actual on-chain balances for all orphans
+                sweep_list = []
+                for mint, amt in orphans:
+                    try:
+                        bal_raw, _ = executor._get_token_balance_sync(mint)
+                        if bal_raw > 0:
+                            sweep_list.append((mint, bal_raw))
+                    except Exception as e:
+                        sym = WELL_KNOWN_TOKENS.get(mint, {}).get('symbol', mint[:8] + '..')
+                        print(f"    Balance check failed for {sym}: {e}")
+
+                if sweep_list and hasattr(executor, '_sweep_tokens_batch_sync'):
+                    # Batch sweep: all swaps + 1 tip in a single request (up to 15 tokens)
+                    results = executor._sweep_tokens_batch_sync(sweep_list)
+                    for mint, _ in sweep_list:
+                        sym = WELL_KNOWN_TOKENS.get(mint, {}).get('symbol', mint[:8] + '..')
+                        amt = next((a for m, a in orphans if m == mint), 0)
+                        if results.get(mint):
+                            print(f"    Swept {sym} ({amt:.6g}) → SOL ✓")
+                        else:
+                            print(f"    Failed to sweep {sym} ({amt:.6g})")
+                elif sweep_list:
+                    # Fallback: sweep one at a time
+                    for mint, bal_raw in sweep_list:
+                        sym = WELL_KNOWN_TOKENS.get(mint, {}).get('symbol', mint[:8] + '..')
+                        amt = next((a for m, a in orphans if m == mint), 0)
+                        ok = executor._sweep_token_sync(mint, bal_raw)
+                        if ok:
+                            print(f"    Swept {sym} ({amt:.6g}) → SOL ✓")
+                        else:
+                            print(f"    Failed to sweep {sym} ({amt:.6g})")
+                # Capital will be re-synced in the main loop once token prices are available
+        except Exception as e:
+            logger.warning(f"Startup orphan sweep failed: {e}")
 
     # Print startup banner
     print_banner(config, num_pairs, mode)
@@ -320,6 +386,14 @@ async def run_monitor(config: Config, args):
                     if size is None:
                         continue
 
+                    # Paper realism: simulate execution latency + z-score decay
+                    if hasattr(executor, 'simulate_latency'):
+                        reject_reason = executor.simulate_latency(sig)
+                        if reject_reason:
+                            logger.info(f"Paper latency reject: {reject_reason}")
+                            db.save_signal(sig, acted_on=False, reason=reject_reason)
+                            continue
+
                     # Execute
                     try:
                         execution = await executor.execute_entry(sig, size, entry_prices)
@@ -332,12 +406,11 @@ async def run_monitor(config: Config, args):
                     # Fill prices from execution
                     fill_prices = [f.price for f in execution.fills]
 
-                    # Update position sizes with actual fill quantities from Jupiter
+                    # Update position sizes with actual fill quantities
                     # so exits sell exactly what was received, not the estimate
-                    if not execution.is_paper:
-                        for i, fill in enumerate(execution.fills):
-                            size.amounts[i] = fill.quantity
-                            size.amounts_raw[i] = fill.quantity_raw
+                    for i, fill in enumerate(execution.fills):
+                        size.amounts[i] = fill.quantity
+                        size.amounts_raw[i] = fill.quantity_raw
 
                     position = portfolio.open_position(
                         sig, size, is_paper=config.paper_trade,
@@ -383,7 +456,12 @@ async def run_monitor(config: Config, args):
                     exit_prices = [signal_gen.token_prices.get(m, position.current_prices[i])
                                    for i, m in enumerate(position.mints)]
 
-                    execution = await executor.execute_exit(position, exit_prices)
+                    other_mints = {m for pk, p in portfolio.positions.items() if pk != sig.pair_key for m in p.mints}
+                    try:
+                        execution = await executor.execute_exit(position, exit_prices, other_position_mints=other_mints)
+                    except Exception as e:
+                        logger.error(f"execute_exit failed for {sig.pair_key}: {e} — position kept open")
+                        continue
                     # Update current prices from fills
                     for i, fill in enumerate(execution.fills):
                         position.current_prices[i] = fill.price
@@ -406,6 +484,22 @@ async def run_monitor(config: Config, args):
                 if bs:
                     pos.current_zscore = bs.current_zscore
 
+            # Live mode: sync capital from actual wallet value (SOL + tokens)
+            if not config.paper_trade and hasattr(executor, 'get_sol_balance_sync') and signal_gen.sol_usd_price > 0:
+                try:
+                    loop = asyncio.get_event_loop()
+                    sol_balance = await loop.run_in_executor(
+                        None, executor.get_sol_balance_sync)
+                    token_balances = await loop.run_in_executor(
+                        None, executor.get_all_token_balances_sync)
+                    # Ensure price feed tracks all wallet tokens
+                    feed.update_mints({mint for mint, _ in token_balances})
+                    portfolio.sync_wallet_capital(
+                        sol_balance, signal_gen.sol_usd_price,
+                        token_balances, signal_gen.token_prices)
+                except Exception as e:
+                    logger.debug(f"Wallet balance sync failed: {e}")
+
             # Dollar-based stop loss
             for pair_key in list(portfolio.positions.keys()):
                 pos = portfolio.positions[pair_key]
@@ -413,7 +507,12 @@ async def run_monitor(config: Config, args):
                 if entry_value > 0 and pos.unrealized_pnl < -entry_value * config.max_position_loss_pct:
                     exit_prices = [signal_gen.token_prices.get(m, pos.current_prices[i])
                                    for i, m in enumerate(pos.mints)]
-                    execution = await executor.execute_exit(pos, exit_prices)
+                    other_mints = {m for pk, p in portfolio.positions.items() if pk != pair_key for m in p.mints}
+                    try:
+                        execution = await executor.execute_exit(pos, exit_prices, other_position_mints=other_mints)
+                    except Exception as e:
+                        logger.error(f"dollar_stop exit failed for {pair_key}: {e} — position kept open")
+                        continue
                     for i, fill in enumerate(execution.fills):
                         pos.current_prices[i] = fill.price
                     closed = portfolio.close_position(pair_key, 0.0, 0, "dollar_stop",
@@ -441,7 +540,12 @@ async def run_monitor(config: Config, args):
                 if age > max_age:
                     exit_prices = [signal_gen.token_prices.get(m, pos.current_prices[i])
                                    for i, m in enumerate(pos.mints)]
-                    execution = await executor.execute_exit(pos, exit_prices)
+                    other_mints = {m for pk, p in portfolio.positions.items() if pk != pair_key for m in p.mints}
+                    try:
+                        execution = await executor.execute_exit(pos, exit_prices, other_position_mints=other_mints)
+                    except Exception as e:
+                        logger.error(f"time_exit failed for {pair_key}: {e} — position kept open")
+                        continue
                     for i, fill in enumerate(execution.fills):
                         pos.current_prices[i] = fill.price
                     closed = portfolio.close_position(pair_key, pos.current_zscore, 0, "time_exit",
@@ -466,7 +570,12 @@ async def run_monitor(config: Config, args):
                     if p <= 0:
                         p = pos.entry_prices[i]
                     exit_prices.append(p)
-                execution = await executor.execute_exit(pos, exit_prices)
+                other_mints = {m for pk, p in portfolio.positions.items() if pk != pair_key for m in p.mints}
+                try:
+                    execution = await executor.execute_exit(pos, exit_prices, other_position_mints=other_mints)
+                except Exception as e:
+                    logger.error(f"orphan_cleanup exit failed for {pair_key}: {e} — position kept open")
+                    continue
                 for i, fill in enumerate(execution.fills):
                     pos.current_prices[i] = fill.price
                 closed = portfolio.close_position(pair_key, 0.0, 0, "orphan_cleanup",
