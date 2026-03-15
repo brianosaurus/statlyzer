@@ -35,6 +35,7 @@ def print_banner(config, num_pairs: int, mode: str):
     print(f"  Max positions:   {config.max_positions}")
     print(f"  Max exposure:    {config.max_exposure_ratio:.0%} of capital")
     print(f"  Sizing:          {config.sizing_method} ({config.fixed_fraction:.0%})")
+    print(f"  Max half-life:   {config.max_half_life_secs:.0f}s ({config.max_half_life_secs/60:.0f}min)")
     print(f"  Resample:        {config.signal_resample_secs:.0f}s candles, {config.lookback_window} lookback")
     print(f"{'=' * 72}\n")
 
@@ -76,18 +77,34 @@ def print_exit(position, reason: str):
           f"P&L {pnl_str}{fees_str}  ({reason}, {duration}s)")
 
 
-def print_positions(positions: Dict, portfolio_value: float):
-    """Print open positions table."""
+def print_positions(positions: Dict, portfolio_value: float,
+                    basket_states: Dict = None, max_age_half_lives: float = 5.0):
+    """Print open positions table with time-to-timeout."""
     if positions:
-        print(f"\n  {'Basket':<24} {'Dir':<6} {'Entry Z':>8} {'Curr Z':>8} {'Unrl P&L':>10} {'Exposure':>10}")
-        print(f"  {'-'*24} {'-'*6} {'-'*8} {'-'*8} {'-'*10} {'-'*10}")
+        print(f"\n  {'Basket':<24} {'Dir':<6} {'Entry Z':>8} {'Curr Z':>8} {'Unrl P&L':>10} {'Exposure':>10} {'Timeout':>10}")
+        print(f"  {'-'*24} {'-'*6} {'-'*8} {'-'*8} {'-'*10} {'-'*10} {'-'*10}")
 
+        now = int(time.time())
         for pair_key, pos in positions.items():
             pair_short = pair_key[:8] + '..' + pair_key[-6:]
             exposure = sum(abs(pos.current_prices[i] * pos.quantities[i])
                           for i in range(pos.basket_size))
+            # Compute time remaining until timeout
+            timeout_str = "—"
+            if basket_states:
+                bsk = basket_states.get(pair_key)
+                if bsk and bsk.half_life > 0 and bsk.half_life != float('inf'):
+                    hl_seconds = bsk.half_life / 2.5
+                    max_age = hl_seconds * max_age_half_lives
+                    remaining = max_age - (now - pos.entry_time)
+                    if remaining <= 0:
+                        timeout_str = "NOW"
+                    elif remaining < 3600:
+                        timeout_str = f"{remaining / 60:.0f}m"
+                    else:
+                        timeout_str = f"{remaining / 3600:.1f}h"
             print(f"  {pair_short:<24} {pos.direction:<6} {pos.entry_zscore:>+8.3f} "
-                  f"{pos.current_zscore:>+8.3f} {pos.unrealized_pnl:>+10.2f} {exposure:>10.0f}")
+                  f"{pos.current_zscore:>+8.3f} {pos.unrealized_pnl:>+10.2f} {exposure:>10.0f} {timeout_str:>10}")
 
     print(f"\n  Portfolio value: ${portfolio_value:,.2f}")
 

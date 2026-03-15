@@ -124,6 +124,16 @@ class Database:
                 log_prices_json TEXT NOT NULL
             );
 
+            CREATE TABLE IF NOT EXISTS transactions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                submit_timestamp REAL NOT NULL,
+                slot INTEGER,
+                signature TEXT NOT NULL,
+                confirmation_slot INTEGER,
+                confirmation_timestamp REAL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_transactions_sig ON transactions(signature);
             CREATE INDEX IF NOT EXISTS idx_signals_pair ON signals(pair_key);
             CREATE INDEX IF NOT EXISTS idx_signals_time ON signals(timestamp);
             CREATE INDEX IF NOT EXISTS idx_positions_status ON positions(status);
@@ -409,6 +419,25 @@ class Database:
             'total_realized_pnl': total_pnl,
             'total_signals': signals,
         }
+
+    # --- Transaction timing ---
+
+    def save_transaction(self, submit_timestamp: float, slot: int,
+                         signature: str) -> int:
+        cursor = self.conn.execute(
+            "INSERT INTO transactions (submit_timestamp, slot, signature) VALUES (?, ?, ?)",
+            (submit_timestamp, slot, signature),
+        )
+        self.conn.commit()
+        return cursor.lastrowid
+
+    def confirm_transaction(self, signature: str, confirmation_slot: int,
+                            confirmation_timestamp: float) -> None:
+        self.conn.execute(
+            "UPDATE transactions SET confirmation_slot = ?, confirmation_timestamp = ? WHERE signature = ?",
+            (confirmation_slot, confirmation_timestamp, signature),
+        )
+        self.conn.commit()
 
     def close(self):
         self.conn.close()

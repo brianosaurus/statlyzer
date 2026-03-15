@@ -232,16 +232,16 @@ class PortfolioManager:
 
             position.unrealized_pnl = pnl
 
-        # Update peak value
-        total = self.get_total_value()
-        if total > self.peak_value:
-            self.peak_value = total
+        # Update peak value (realized capital only — unrealized is too noisy)
+        if self.initial_capital > self.peak_value:
+            self.peak_value = self.initial_capital
             self.db.set_state('peak_value', str(self.peak_value))
 
     def get_total_exposure(self) -> float:
         total = 0.0
         for p in self.positions.values():
-            for i in range(p.basket_size):
+            n = min(p.basket_size, len(p.current_prices), len(p.quantities))
+            for i in range(n):
                 total += abs(p.current_prices[i] * p.quantities[i])
         return total
 
@@ -252,10 +252,10 @@ class PortfolioManager:
         return self.initial_capital + self.get_total_unrealized_pnl()
 
     def get_drawdown(self) -> float:
+        """Drawdown based on realized capital only (ignores unrealized P&L)."""
         if self.peak_value <= 0:
             return 0.0
-        total = self.get_total_value()
-        return (self.peak_value - total) / self.peak_value
+        return (self.peak_value - self.initial_capital) / self.peak_value
 
     def has_position(self, pair_key: str) -> bool:
         return pair_key in self.positions
@@ -274,7 +274,6 @@ class PortfolioManager:
     def save_capital(self):
         """Persist initial capital to DB and ensure peak_value is consistent."""
         self.db.set_state('initial_capital', str(self.initial_capital))
-        current_value = self.get_total_value()
-        if current_value > self.peak_value:
-            self.peak_value = current_value
+        if self.initial_capital > self.peak_value:
+            self.peak_value = self.initial_capital
             self.db.set_state('peak_value', str(self.peak_value))

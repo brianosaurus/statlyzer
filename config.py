@@ -50,17 +50,19 @@ class Config:
     pair_staleness_hours: int = int(os.getenv('PAIR_STALENESS_HOURS', '24'))
     min_half_life: float = float(os.getenv('MIN_HALF_LIFE', '200'))
     max_half_life_ratio: float = float(os.getenv('MAX_HALF_LIFE_RATIO', '0.5'))
+    max_half_life_secs: float = float(os.getenv('MAX_HALF_LIFE_SECS', '1800'))  # 30min default
     max_positions_per_token: int = int(os.getenv('MAX_POSITIONS_PER_TOKEN', '3'))
 
     # Execution
     slippage_bps: int = int(os.getenv('SLIPPAGE_BPS', '50'))
     priority_fee_lamports: int = int(os.getenv('PRIORITY_FEE', '10000'))
-    use_jito: bool = os.getenv('USE_JITO', 'false').lower() == 'true'
-    jito_tip_lamports: int = int(os.getenv('JITO_TIP', '10000'))
-    jito_block_engine: str = os.getenv('JITO_BLOCK_ENGINE', 'https://frankfurt.mainnet.block-engine.jito.wtf')
+    use_lunar_lander: bool = os.getenv('USE_LUNAR_LANDER', 'false').lower() == 'true'
+    lunar_lander_tip_lamports: int = int(os.getenv('LUNAR_LANDER_TIP', '1000000'))  # 0.001 SOL minimum
+    lunar_lander_endpoint: str = os.getenv('LUNAR_LANDER_ENDPOINT', 'http://fra.lunar-lander.hellomoon.io')
+    lunar_lander_api_key: str = os.getenv('LUNAR_LANDER_API_KEY', '')
 
     # Price feed
-    price_poll_interval: float = float(os.getenv('PRICE_POLL_INTERVAL', '30'))
+    price_poll_interval: float = float(os.getenv('PRICE_POLL_INTERVAL', '6'))
 
     # Mode
     paper_trade: bool = os.getenv('PAPER_TRADE', 'true').lower() == 'true'

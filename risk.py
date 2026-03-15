@@ -98,6 +98,10 @@ class RiskManager:
         max_hl = lookback_blocks * self.config.max_half_life_ratio
         if hl > max_hl and hl != float('inf'):
             return RiskCheck(False, f"Half-life too long ({hl:.1f} > {max_hl:.1f})")
+        # Absolute max half-life in seconds (blocks * 0.4s/block)
+        hl_secs = hl * 0.4
+        if hl_secs > self.config.max_half_life_secs:
+            return RiskCheck(False, f"Half-life {hl_secs:.0f}s > {self.config.max_half_life_secs:.0f}s max")
 
         return RiskCheck(True)
 

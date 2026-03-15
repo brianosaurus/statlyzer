@@ -79,6 +79,8 @@ def parse_args():
                         help='Sizing method: fixed_fraction or kelly')
     parser.add_argument('--max-entry-z', type=float, default=None,
                         help='Max entry z-score (reject entries above this)')
+    parser.add_argument('--max-hl', type=float, default=None,
+                        help='Max half-life in seconds (reject slow mean-reverters)')
     parser.add_argument('--direction', type=str, default=None, choices=['both', 'long', 'short'],
                         help='Allowed trade direction: both, long, or short')
     parser.add_argument('--verbose', action='store_true',
@@ -114,6 +116,8 @@ def apply_overrides(config: Config, args):
         config.sizing_method = args.sizing
     if args.max_entry_z is not None:
         config.max_entry_zscore = args.max_entry_z
+    if args.max_hl is not None:
+        config.max_half_life_secs = args.max_hl
     if args.direction is not None:
         config.allowed_direction = args.direction
     if args.live and args.confirm_live:
@@ -155,13 +159,8 @@ def show_status(config: Config, db_path: str):
 
 async def run_monitor(config: Config, args):
     """Main monitoring and trading loop."""
-    # Initialize components
+    # Initialize executor first (live mode needs wallet balance before portfolio)
     db = Database(args.db)
-    scanner_path = config.scanner_db_path if config.use_scanner_db else None
-    signal_gen = SignalGenerator(config, scanner_path, db=db)
-    portfolio = PortfolioManager(config, db)
-    risk_mgr = RiskManager(config, portfolio)
-    sizer = PositionSizer(config)
 
     if args.quote:
         executor = QuoteExecutor(config, db)
@@ -172,6 +171,33 @@ async def run_monitor(config: Config, args):
     else:
         executor = LiveExecutor(config, db)
         mode = "LIVE TRADING"
+
+        # In live mode, set working capital from wallet SOL balance
+        # unless --capital was explicitly provided
+        if args.capital is None:
+            from constants import USDC_MINT
+            sol_balance = executor.get_sol_balance_sync()
+            sol_quote = executor._get_quote(
+                "So11111111111111111111111111111111111111112",
+                USDC_MINT, 1_000_000_000)
+            if sol_quote:
+                sol_price = int(sol_quote["outAmount"]) / 1e6
+                wallet_usd = sol_balance * sol_price
+                config.initial_capital = wallet_usd
+                executor.sol_usd_price = sol_price
+                # Persist to DB so PortfolioManager picks it up
+                db.set_state('initial_capital', str(wallet_usd))
+                db.set_state('peak_value', str(wallet_usd))
+                print(f"  Wallet: {sol_balance:.6f} SOL (${wallet_usd:.2f} @ ${sol_price:.2f}/SOL)")
+            else:
+                print(f"  WARNING: Could not get SOL price, using --capital or default")
+
+    # Initialize remaining components (after capital is set)
+    scanner_path = config.scanner_db_path if config.use_scanner_db else None
+    signal_gen = SignalGenerator(config, scanner_path, db=db)
+    portfolio = PortfolioManager(config, db)
+    risk_mgr = RiskManager(config, portfolio)
+    sizer = PositionSizer(config)
 
     # Load cointegrated baskets
     num_pairs = signal_gen.load_baskets()
@@ -208,7 +234,7 @@ async def run_monitor(config: Config, args):
                 pos = portfolio.positions[pair_key]
                 # Use entry prices as fallback (no live prices yet)
                 exit_prices = list(pos.entry_prices)
-                execution = executor.execute_exit(pos, exit_prices)
+                execution = await executor.execute_exit(pos, exit_prices)
                 for i, fill in enumerate(execution.fills):
                     pos.current_prices[i] = fill.price
                 closed = portfolio.close_position(pair_key, 0.0, 0, "direction_filter",
@@ -219,6 +245,7 @@ async def run_monitor(config: Config, args):
                     if basket_state:
                         basket_state.in_position = False
                     print(f"    Closed {unwanted} {pair_key[:16]}.. P&L: ${closed.realized_pnl:+.2f}")
+
 
     # Persist initial capital
     portfolio.save_capital()
@@ -294,12 +321,23 @@ async def run_monitor(config: Config, args):
                         continue
 
                     # Execute
-                    execution = executor.execute_entry(sig, size, entry_prices)
+                    try:
+                        execution = await executor.execute_entry(sig, size, entry_prices)
+                    except Exception as e:
+                        logger.error(f"execute_entry failed for {sig.pair_key}: {e}")
+                        continue
                     if execution is None:
                         continue
 
                     # Fill prices from execution
                     fill_prices = [f.price for f in execution.fills]
+
+                    # Update position sizes with actual fill quantities from Jupiter
+                    # so exits sell exactly what was received, not the estimate
+                    if not execution.is_paper:
+                        for i, fill in enumerate(execution.fills):
+                            size.amounts[i] = fill.quantity
+                            size.amounts_raw[i] = fill.quantity_raw
 
                     position = portfolio.open_position(
                         sig, size, is_paper=config.paper_trade,
@@ -345,7 +383,7 @@ async def run_monitor(config: Config, args):
                     exit_prices = [signal_gen.token_prices.get(m, position.current_prices[i])
                                    for i, m in enumerate(position.mints)]
 
-                    execution = executor.execute_exit(position, exit_prices)
+                    execution = await executor.execute_exit(position, exit_prices)
                     # Update current prices from fills
                     for i, fill in enumerate(execution.fills):
                         position.current_prices[i] = fill.price
@@ -359,6 +397,7 @@ async def run_monitor(config: Config, args):
                         if basket_state:
                             basket_state.in_position = False
                         print_exit(closed, reason)
+    
 
             # Mark-to-market using Jupiter prices directly
             portfolio.mark_to_market(signal_gen.token_prices)
@@ -374,7 +413,7 @@ async def run_monitor(config: Config, args):
                 if entry_value > 0 and pos.unrealized_pnl < -entry_value * config.max_position_loss_pct:
                     exit_prices = [signal_gen.token_prices.get(m, pos.current_prices[i])
                                    for i, m in enumerate(pos.mints)]
-                    execution = executor.execute_exit(pos, exit_prices)
+                    execution = await executor.execute_exit(pos, exit_prices)
                     for i, fill in enumerate(execution.fills):
                         pos.current_prices[i] = fill.price
                     closed = portfolio.close_position(pair_key, 0.0, 0, "dollar_stop",
@@ -385,6 +424,7 @@ async def run_monitor(config: Config, args):
                         if basket_state:
                             basket_state.in_position = False
                         print_exit(closed, f"dollar_stop (lost >{config.max_position_loss_pct:.0%})")
+    
 
             # Time-based exit: close positions older than N half-lives
             now = int(time.time())
@@ -401,7 +441,7 @@ async def run_monitor(config: Config, args):
                 if age > max_age:
                     exit_prices = [signal_gen.token_prices.get(m, pos.current_prices[i])
                                    for i, m in enumerate(pos.mints)]
-                    execution = executor.execute_exit(pos, exit_prices)
+                    execution = await executor.execute_exit(pos, exit_prices)
                     for i, fill in enumerate(execution.fills):
                         pos.current_prices[i] = fill.price
                     closed = portfolio.close_position(pair_key, pos.current_zscore, 0, "time_exit",
@@ -411,6 +451,7 @@ async def run_monitor(config: Config, args):
                         if basket_state:
                             basket_state.in_position = False
                         print_exit(closed, f"time_exit ({age:.0f}s > {max_age:.0f}s = {config.max_position_age_half_lives}x HL)")
+    
 
             # Orphan cleanup
             for pair_key in list(portfolio.positions.keys()):
@@ -425,7 +466,7 @@ async def run_monitor(config: Config, args):
                     if p <= 0:
                         p = pos.entry_prices[i]
                     exit_prices.append(p)
-                execution = executor.execute_exit(pos, exit_prices)
+                execution = await executor.execute_exit(pos, exit_prices)
                 for i, fill in enumerate(execution.fills):
                     pos.current_prices[i] = fill.price
                 closed = portfolio.close_position(pair_key, 0.0, 0, "orphan_cleanup",
@@ -433,6 +474,7 @@ async def run_monitor(config: Config, args):
                 if closed:
                     executor.log_execution(closed.id, execution, 0)
                     print_exit(closed, "orphan_cleanup (basket no longer monitored)")
+
 
             # Progress display
             stats['polls'] += 1
@@ -452,7 +494,8 @@ async def run_monitor(config: Config, args):
             now_f = time.time()
             if now_f - last_dashboard > dashboard_interval:
                 print_zscore_dashboard(signal_gen.get_basket_states())
-                print_positions(portfolio.positions, portfolio.get_total_value())
+                print_positions(portfolio.positions, portfolio.get_total_value(),
+                                signal_gen.get_basket_states(), config.max_position_age_half_lives)
                 print_discovery_status(signal_gen.discovery)
                 last_dashboard = now_f
 

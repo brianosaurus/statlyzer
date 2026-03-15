@@ -130,6 +130,23 @@ SWAP_DISCRIMINATORS = {
     b"\x2e\x1d\xc8\x46\x51\x9f\xa8\xb3": f"{METEORA_DLMM} Swap",
 }
 
+# Statalyzer Address Lookup Table — run create_lut.py once to populate
+STATALYZER_LUT_ADDRESS = ""  # fill in after running create_lut.py
+
+# Lunar Lander tip accounts (Hello Moon transaction landing service)
+LUNAR_LANDER_TIP_ACCOUNTS = [
+    "moon17L6BgxXRX5uHKudAmqVF96xia9h8ygcmG2sL3F",
+    "moon26Sek222Md7ZydcAGxoKG832DK36CkLrS3PQY4c",
+    "moon7fwyajcVstMoBnVy7UBcTx87SBtNoGGAaH2Cb8V",
+    "moonBtH9HvLHjLqi9ivyrMVKgFUsSfrz9BwQ9khhn1u",
+    "moonCJg8476LNFLptX1qrK8PdRsA1HD1R6XWyu9MB93",
+    "moonF2sz7qwAtdETnrgxNbjonnhGGjd6r4W4UC9284s",
+    "moonKfftMiGSak3cezvhEqvkPSzwrmQxQHXuspC96yj",
+    "moonQBUKBpkifLcTd78bfxxt4PYLwmJ5admLW6cBBs8",
+    "moonXwpKwoVkMegt5Bc776cSW793X1irL5hHV1vJ3JA",
+    "moonZ6u9E2fgk6eWd82621eLPHt9zuJuYECXAYjMY1C",
+]
+
 # Jito tip accounts
 JITO_TIP_ACCOUNTS = {
     "96gYZGLnJYVFmbjzopPSU6QiEV5fGqZNyN9nmNhvrZU5",

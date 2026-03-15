@@ -22,18 +22,26 @@ from typing import Dict, List, Optional, Tuple
 
 
 EXPERIMENTS = {
-    "D": {"db": "exp_d.db", "label": "Conservative",
-           "desc": "30pos/8tok/2x/5%/short/z3.0/$5k"},
     "F": {"db": "exp_f.db", "label": "Aggressive",
            "desc": "40pos/10tok/3x/5%/short/z3.0/$5k"},
     "G": {"db": "exp_g.db", "label": "10k capital",
            "desc": "40pos/10tok/3x/5%/short/z3.0/$10k"},
-    "H": {"db": "exp_h.db", "label": "25k capital",
-           "desc": "40pos/10tok/3x/5%/short/z3.0/$25k"},
     "I": {"db": "exp_i.db", "label": "15k capital",
            "desc": "40pos/10tok/3x/5%/short/z3.0/$15k"},
     "J": {"db": "exp_j.db", "label": "30k capital",
            "desc": "40pos/10tok/3x/5%/short/z3.0/$30k"},
+    "K": {"db": "exp_k.db", "label": "+5% aggressive",
+           "desc": "40pos/10tok/3.15x/5.25%/short/z3.0/$30k"},
+    "L": {"db": "exp_l.db", "label": "+10% aggressive",
+           "desc": "40pos/10tok/3.3x/5.5%/short/z3.0/$30k"},
+    "M": {"db": "exp_m.db", "label": "+15% aggressive",
+           "desc": "40pos/10tok/3.47x/5.78%/short/z3.0/$30k"},
+    "N": {"db": "exp_n.db", "label": "+20% aggressive",
+           "desc": "40pos/10tok/3.63x/6.05%/short/z3.0/$30k"},
+    "P": {"db": "exp_p.db", "label": "LIVE $102",
+           "desc": "40pos/10tok/3.63x/6.05%/both/z2.7-3.0/$102/LIVE"},
+    "Q": {"db": "exp_q.db", "label": "Optimized",
+           "desc": "60pos/15tok/4.2x/7%/both/z2.5-3.5/ez0.3/sz5.0/$30k"},
 }
 
 
