@@ -155,15 +155,17 @@ class SignalGenerator:
         skipped_stable = 0
         skipped_unknown = 0
         for b in baskets_data:
-            # Half-life filter
+            # Half-life filter (scanner reports half-life in periods of its resample interval)
             hl_periods = b.get('half_life', float('inf'))
             if hl_periods == float('inf') or hl_periods <= 0:
                 continue
-            hl = hl_periods * 750  # Convert resampling periods to blocks
-            if hl < self.config.min_half_life:
+            # Convert scanner periods to seconds (scanner uses ~300s resample)
+            hl_secs = hl_periods * 300
+            if hl_secs > self.config.max_half_life_secs:
                 continue
-            lookback_blocks = self.config.lookback_window * self.config.signal_resample_secs / 0.4
-            if hl > lookback_blocks * self.config.max_half_life_ratio:
+            # Also convert to blocks for internal use
+            hl = hl_secs / 0.4  # blocks
+            if hl < self.config.min_half_life:
                 continue
 
             # Staleness filter
@@ -191,6 +193,11 @@ class SignalGenerator:
             if any(m in STABLECOIN_MINTS for m in mints):
                 skipped_stable += 1
                 continue
+
+            # Token whitelist: if set, ALL mints must be whitelisted
+            if self.config.token_whitelist_mints:
+                if not all(m in self.config.token_whitelist_mints for m in mints):
+                    continue
 
             basket_key = make_basket_key(mints)
 
@@ -239,6 +246,11 @@ class SignalGenerator:
                 continue
             if r.token_a_mint in STABLECOIN_MINTS or r.token_b_mint in STABLECOIN_MINTS:
                 continue
+            # Token whitelist: if set, ALL mints must be whitelisted
+            if self.config.token_whitelist_mints:
+                if r.token_a_mint not in self.config.token_whitelist_mints or \
+                   r.token_b_mint not in self.config.token_whitelist_mints:
+                    continue
             # Convert half-life from resampled periods to blocks
             hl_blocks = r.half_life * (self.config.coint_resample_secs / 0.4)
             if hl_blocks < self.config.min_half_life:
@@ -467,6 +479,13 @@ class SignalGenerator:
         signal_type = self._check_signal(basket)
         if signal_type is None:
             return None
+
+        # Token whitelist: block ENTRY signals for non-whitelisted baskets
+        # (EXIT/STOP_LOSS must still fire so existing positions can close)
+        if signal_type in (SignalType.ENTRY_LONG, SignalType.ENTRY_SHORT):
+            if self.config.token_whitelist_mints:
+                if not all(m in self.config.token_whitelist_mints for m in basket.mints):
+                    return None
 
         return Signal(
             signal_type=signal_type,

@@ -22,26 +22,38 @@ from typing import Dict, List, Optional, Tuple
 
 
 EXPERIMENTS = {
-    "F": {"db": "exp_f.db", "label": "Aggressive",
-           "desc": "40pos/10tok/3x/5%/short/z3.0/$5k"},
-    "G": {"db": "exp_g.db", "label": "10k capital",
-           "desc": "40pos/10tok/3x/5%/short/z3.0/$10k"},
-    "I": {"db": "exp_i.db", "label": "15k capital",
-           "desc": "40pos/10tok/3x/5%/short/z3.0/$15k"},
-    "J": {"db": "exp_j.db", "label": "30k capital",
-           "desc": "40pos/10tok/3x/5%/short/z3.0/$30k"},
-    "K": {"db": "exp_k.db", "label": "+5% aggressive",
-           "desc": "40pos/10tok/3.15x/5.25%/short/z3.0/$30k"},
-    "L": {"db": "exp_l.db", "label": "+10% aggressive",
-           "desc": "40pos/10tok/3.3x/5.5%/short/z3.0/$30k"},
-    "M": {"db": "exp_m.db", "label": "+15% aggressive",
-           "desc": "40pos/10tok/3.47x/5.78%/short/z3.0/$30k"},
-    "N": {"db": "exp_n.db", "label": "+20% aggressive",
-           "desc": "40pos/10tok/3.63x/6.05%/short/z3.0/$30k"},
-    "P": {"db": "exp_p.db", "label": "LIVE $102",
-           "desc": "40pos/10tok/3.63x/6.05%/both/z2.7-3.0/$102/LIVE"},
-    "Q": {"db": "exp_q.db", "label": "Optimized",
-           "desc": "60pos/15tok/4.2x/7%/both/z2.5-3.5/ez0.3/sz5.0/$30k"},
+    "P": {"db": "exp_p.db", "label": "LIVE $88",
+           "desc": "40pos/10tok/3.63x/6%/z2.7-3.0/$88/LIVE"},
+    # Phase 1: Diagnostic — sweep slippage to find break-even
+    "AA": {"db": "exp_aa.db", "label": "0bps $5k",
+            "desc": "40pos/10tok/5x/5%/z2.0-4.0/ez0.3/0bps/30s/$5k"},
+    "BB": {"db": "exp_bb.db", "label": "5bps $5k",
+            "desc": "40pos/10tok/5x/5%/z2.0-4.0/ez0.3/5bps/30s/$5k"},
+    "CC": {"db": "exp_cc.db", "label": "15bps $5k",
+            "desc": "40pos/10tok/5x/5%/z2.0-4.0/ez0.3/15bps/30s/$5k"},
+    "DD": {"db": "exp_dd.db", "label": "25bps $5k",
+            "desc": "40pos/10tok/5x/5%/z2.0-4.0/ez0.3/25bps/30s/$5k"},
+    # Phase 2: Optimized for profit
+    "EE": {"db": "exp_ee.db", "label": "MaxVol $20k",
+            "desc": "60pos/15tok/5x/10%/z1.5-4.0/ez0.1/10bps/30s/100hr/$20k"},
+    "FF": {"db": "exp_ff.db", "label": "HiZ $10k",
+            "desc": "40pos/10tok/5x/7%/z2.5-4.0/ez0.2/10bps/30s/noStop/$10k"},
+    "GG": {"db": "exp_gg.db", "label": "Fast $10k",
+            "desc": "40pos/10tok/5x/10%/z2.0-4.0/ez0.2/15bps/15s/60hr/$10k"},
+    "HH": {"db": "exp_hh.db", "label": "P-opt $10k",
+            "desc": "40pos/10tok/4x/7%/z2.7-3.5/ez0.3/10bps/30s/40hr/$10k"},
+    # Phase 3: Whitelist (real slippage, low-slippage tokens only)
+    "II": {"db": "exp_ii.db", "label": "WL $10k",
+            "desc": "40pos/10tok/5x/7%/z2.0-4.0/ez0.2/24bps/30s/WL/$10k"},
+    "JJ": {"db": "exp_jj.db", "label": "$1k/d $50k",
+            "desc": "60pos/15tok/5x/10%/z1.5-4.0/ez0.1/24bps/30s/WL/100hr/$50k"},
+    "KK": {"db": "exp_kk.db", "label": "$1k/d opt",
+            "desc": "60pos/15tok/5x/10%/z1.5-4.0/ez0.1/10bps/30s/WL/100hr/$50k"},
+    # Phase 4: LST-only (pure LST baskets, realistic 5bps)
+    "LL": {"db": "exp_ll.db", "label": "LST $10k",
+            "desc": "40pos/10tok/5x/7%/z2.0-4.0/ez0.2/5bps/30s/LST/$10k"},
+    "MM": {"db": "exp_mm.db", "label": "LST $50k",
+            "desc": "60pos/15tok/5x/10%/z1.5-4.0/ez0.1/5bps/30s/LST/100hr/$50k"},
 }
 
 

@@ -211,11 +211,16 @@ class PaperExecutor:
         return random.lognormvariate(mu, sigma)
 
     def _total_fee_lamports(self, num_legs: int) -> int:
-        """Total fee in lamports for a basket trade."""
+        """Total fee in lamports for a basket trade (bundled pricing).
+
+        Models P's bundle approach: ceil(num_legs/3) bundles, each with 1 tip tx.
+        """
+        import math as _math
         per_leg = self.BASE_TX_FEE_LAMPORTS + self.config.priority_fee_lamports
         total = per_leg * num_legs
         if self.config.use_lunar_lander:
-            total += self.config.lunar_lander_tip_lamports + self.BASE_TX_FEE_LAMPORTS
+            num_bundles = _math.ceil(num_legs / 3)
+            total += num_bundles * (self.config.lunar_lander_tip_lamports + self.BASE_TX_FEE_LAMPORTS)
         return total
 
     def _estimate_fees_usd(self, num_legs: int) -> float:
@@ -239,14 +244,15 @@ class QuoteExecutor:
         self.sol_usd_price: float = 0.0  # set by statalyzer main loop
 
     def _estimate_fees_usd(self, num_legs: int = 2) -> float:
-        """Estimate total transaction fees in USD for a basket trade.
-        With Jito bundles there's also a tip transaction per bundle."""
+        """Estimate total transaction fees in USD for a basket trade (bundled pricing)."""
+        import math as _math
         if self.sol_usd_price <= 0:
             return 0.0
         per_leg_lamports = self.BASE_TX_FEE_LAMPORTS + self.config.priority_fee_lamports
         total_lamports = per_leg_lamports * num_legs
         if self.config.use_lunar_lander:
-            total_lamports += self.config.lunar_lander_tip_lamports + self.BASE_TX_FEE_LAMPORTS
+            num_bundles = _math.ceil(num_legs / 3)
+            total_lamports += num_bundles * (self.config.lunar_lander_tip_lamports + self.BASE_TX_FEE_LAMPORTS)
         return (total_lamports / 1e9) * self.sol_usd_price
 
     def _get_prices(self, *mints: str) -> dict:
@@ -1187,6 +1193,7 @@ class LiveExecutor:
 
         legs = []
         sol_fills = []  # SOL legs need no swap
+        zero_balance_fills = []  # Legs with 0 on-chain balance (already sold/swept)
         for i in range(position.basket_size):
             signed_hr = hr[i] if position.direction == "long" else -hr[i]
             side = "sell" if signed_hr > 0 else "buy"
@@ -1213,10 +1220,15 @@ class LiveExecutor:
                                     f"{actual_raw} raw (recorded: {position.quantities_raw[i]}) — "
                                     f"using actual on-chain balance")
                 else:
-                    logger.warning(f"Exit leg {i} {position.mints[i][:8]}.. has 0 on-chain balance, "
-                                   f"using recorded qty {position.quantities_raw[i]}")
-                    actual_raw = position.quantities_raw[i]
-                    actual_qty = position.quantities[i]
+                    # Token already sold/swept — skip this leg entirely
+                    logger.warning(f"Exit leg {i} {position.mints[i][:8]}.. has 0 on-chain balance — "
+                                   f"already sold/swept, skipping")
+                    zero_balance_fills.append(Fill(
+                        token_mint=position.mints[i], side=side, price=prices[i],
+                        quantity=0, quantity_raw=0,
+                        slippage_bps=0, timestamp=int(time.time()),
+                    ))
+                    continue
             except Exception as e:
                 logger.warning(f"Could not fetch on-chain balance for {position.mints[i][:8]}..: {e}, "
                                f"using recorded qty")
@@ -1225,6 +1237,12 @@ class LiveExecutor:
             legs.append((position.mints[i], SOL_MINT, actual_raw,
                          position.mints[i], side, actual_qty,
                          actual_raw, prices[i]))
+
+        # If no legs need swapping (all tokens already sold/swept), return immediately
+        if not legs:
+            logger.info(f"All tokens already sold/swept — closing position with paper fills")
+            all_fills = [f for _, f in sol_fills] + zero_balance_fills
+            return BasketExecution(fills=all_fills, is_paper=False, estimated_fees_usd=0.0)
 
         # Build all swap txs first, then submit in bundles of 3 swaps + 1 tip.
         loop = asyncio.get_running_loop()
@@ -1334,8 +1352,8 @@ class LiveExecutor:
                 else:
                     logger.error(f"Post-exit sweep of {mint[:8]}.. failed — tokens orphaned")
 
-        # Merge SOL fills + swap fills
-        fills = [f for _, f in sol_fills] + swap_fills
+        # Merge SOL fills + zero-balance fills + swap fills
+        fills = [f for _, f in sol_fills] + zero_balance_fills + swap_fills
 
         num_swap_legs = len([f for f in swap_fills if f.tx_signature])
         num_bundles = max(1, (num_swap_legs + max_swaps_per_bundle - 1) // max_swaps_per_bundle)

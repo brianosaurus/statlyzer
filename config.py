@@ -85,3 +85,6 @@ class Config:
     coint_history_capacity: int = int(os.getenv('COINT_HISTORY_CAPACITY', '10000'))
     coint_warmup_minutes: float = float(os.getenv('COINT_WARMUP_MINUTES', '30'))
     use_scanner_db: bool = os.getenv('USE_SCANNER_DB', 'true').lower() == 'true'
+
+    # Token whitelist: if set, only trade baskets where ALL mints are in this set
+    token_whitelist_mints: set = None  # populated from --token-whitelist CLI arg

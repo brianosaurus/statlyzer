@@ -83,6 +83,17 @@ def parse_args():
                         help='Max half-life in seconds (reject slow mean-reverters)')
     parser.add_argument('--direction', type=str, default=None, choices=['both', 'long', 'short'],
                         help='Allowed trade direction: both, long, or short')
+    parser.add_argument('--candle-interval', type=float, default=None,
+                        help='Candle resample interval in seconds (default: 300)')
+    parser.add_argument('--slippage-bps', type=int, default=None,
+                        help='Slippage in basis points (default: from .env)')
+    parser.add_argument('--max-per-hour', type=int, default=None,
+                        help='Max new positions per hour (default: 5)')
+    parser.add_argument('--no-paper-errors', action='store_true',
+                        help='Disable paper leg failures and latency rejections')
+    parser.add_argument('--token-whitelist', type=str, default=None,
+                        help='Only trade baskets where ALL tokens are in this comma-separated list '
+                             '(e.g. bSOL,mSOL,jitoSOL,jupSOL,BONK)')
     parser.add_argument('--verbose', action='store_true',
                         help='Enable debug logging')
     return parser.parse_args()
@@ -120,6 +131,29 @@ def apply_overrides(config: Config, args):
         config.max_half_life_secs = args.max_hl
     if args.direction is not None:
         config.allowed_direction = args.direction
+    if args.candle_interval is not None:
+        config.signal_resample_secs = args.candle_interval
+    if args.slippage_bps is not None:
+        config.slippage_bps = args.slippage_bps
+    if args.max_per_hour is not None:
+        config.max_positions_per_hour = args.max_per_hour
+    if args.no_paper_errors:
+        config.paper_leg_failure_pct = 0.0
+        config.paper_latency_mean_s = 0.0
+        config.paper_latency_std_s = 0.0
+    if args.token_whitelist:
+        from constants import WELL_KNOWN_TOKENS
+        symbol_to_mint = {v['symbol']: k for k, v in WELL_KNOWN_TOKENS.items()}
+        whitelist_symbols = [s.strip() for s in args.token_whitelist.split(',')]
+        whitelist_mints = set()
+        for sym in whitelist_symbols:
+            mint = symbol_to_mint.get(sym)
+            if mint:
+                whitelist_mints.add(mint)
+            else:
+                logger.warning(f"Unknown token symbol in whitelist: {sym}")
+        config.token_whitelist_mints = whitelist_mints
+        logger.info(f"Token whitelist: {', '.join(whitelist_symbols)} ({len(whitelist_mints)} mints)")
     if args.live and args.confirm_live:
         config.paper_trade = False
 
@@ -217,11 +251,37 @@ async def run_monitor(config: Config, args):
     if num_pairs == 0:
         print("  No baskets yet — waiting for inline discovery (warmup ~60 min)...")
 
-    # Sync position state: mark baskets that have open positions
-    for pair_key in portfolio.positions:
+    # Sync position state: mark baskets that have open positions.
+    # If a position's basket is no longer in the scanner DB (filtered out by
+    # half-life, staleness, etc.), create a synthetic basket so exit/stop
+    # signals can still fire.
+    from signals import BasketState, token_symbol
+    for pair_key, pos in portfolio.positions.items():
         basket_state = signal_gen.get_basket_states().get(pair_key)
         if basket_state:
             basket_state.in_position = True
+            basket_state.position_entry_time = pos.entry_time
+        else:
+            # Create synthetic basket for orphaned position
+            symbols = [token_symbol(m) for m in pos.mints]
+            synthetic = BasketState(
+                pair_key=pair_key,
+                basket_size=pos.basket_size,
+                mints=pos.mints,
+                symbols=symbols,
+                hedge_ratios=pos.hedge_ratios,
+                half_life=500,  # default; only needed for timeout calc
+                eg_p_value=0.05,
+                cointegration_analyzed_at=pos.entry_time,
+            )
+            synthetic.init_buffers(config.lookback_window)
+            synthetic.in_position = True
+            synthetic.position_entry_time = pos.entry_time
+            signal_gen.baskets[pair_key] = synthetic
+            for m in pos.mints:
+                signal_gen.monitored_mints.add(m)
+            logger.info(f"Created synthetic basket for orphaned position {pair_key[:16]}.. "
+                        f"({'/'.join(symbols)})")
 
     # Force-close positions that don't match the allowed direction
     if config.allowed_direction in ('long', 'short'):
