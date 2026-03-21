@@ -19,3 +19,6 @@ numpy>=1.24.0,<2.0.0
 
 # Cointegration discovery
 statsmodels>=0.14.0,<1.0.0
+
+# Reinforcement learning (CPU-only; use torch with CUDA if GPU available)
+torch>=2.0.0

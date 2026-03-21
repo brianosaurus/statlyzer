@@ -14,7 +14,7 @@ cd ~/statalyzer
 source ~/venv/bin/activate
 
 SCANNER="--scanner-db ../arbitrage_tracker/arb_tracker.db"
-BASE="--monitor $SCANNER --no-paper-errors --direction both"
+BASE="--monitor $SCANNER --no-paper-errors --direction both --lunar-lander"
 
 # Kill old experiments (excluding P which is live)
 echo "Killing old experiments..."
@@ -135,6 +135,30 @@ nohup python3 statalyzer.py $BASE --capital 50000 --fixed-fraction 0.10 \
     --token-whitelist $LOWSLIP \
     --db exp_kk.db > logs/exp_kk.log 2>&1 &
 echo "  KK: \$1k/day optimistic \$50k whitelist (z1.5, exit0.1, 10bps, 100/hr)"
+
+echo ""
+echo "=== PHASE 4: LST-only (pure LST baskets, realistic 1bps) ==="
+echo ""
+
+LSTS="bSOL,jitoSOL,mSOL,jupSOL,stSOL"
+
+# LL: LST-only conservative $10k
+nohup python3 statalyzer.py $BASE --capital 10000 --fixed-fraction 0.07 \
+    --entry-z 2.0 --max-entry-z 4.0 --exit-z 0.2 --stop-z 5.0 \
+    --max-positions 40 --max-per-token 10 --max-exposure 5.0 \
+    --max-per-hour 60 --candle-interval 30 --slippage-bps 1 --max-hl 7200 \
+    --token-whitelist $LSTS \
+    --db exp_ll.db > logs/exp_ll.log 2>&1 &
+echo "  LL: LST \$10k (z2.0-4.0, exit0.2, 1bps, 60/hr)"
+
+# MM: LST-only aggressive $50k
+nohup python3 statalyzer.py $BASE --capital 50000 --fixed-fraction 0.10 \
+    --entry-z 1.5 --max-entry-z 4.0 --exit-z 0.1 --stop-z 6.0 \
+    --max-positions 60 --max-per-token 15 --max-exposure 5.0 \
+    --max-per-hour 100 --candle-interval 30 --slippage-bps 1 --max-hl 7200 \
+    --token-whitelist $LSTS \
+    --db exp_mm.db > logs/exp_mm.log 2>&1 &
+echo "  MM: LST \$50k (z1.5-4.0, exit0.1, 1bps, 100/hr)"
 
 sleep 2
 echo ""

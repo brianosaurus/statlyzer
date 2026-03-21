@@ -211,16 +211,16 @@ class PaperExecutor:
         return random.lognormvariate(mu, sigma)
 
     def _total_fee_lamports(self, num_legs: int) -> int:
-        """Total fee in lamports for a basket trade (bundled pricing).
+        """Total fee in lamports for one direction (entry or exit).
 
-        Models P's bundle approach: ceil(num_legs/3) bundles, each with 1 tip tx.
+        All legs are bundled into a single Lunar Lander bundle with the tip
+        embedded as an instruction in one of the swap transactions.
+        Cost is fixed per bundle regardless of how many legs (2 or 4).
         """
-        import math as _math
-        per_leg = self.BASE_TX_FEE_LAMPORTS + self.config.priority_fee_lamports
-        total = per_leg * num_legs
+        # Fixed cost per bundle: base fee + priority + tip
+        total = self.BASE_TX_FEE_LAMPORTS + self.config.priority_fee_lamports
         if self.config.use_lunar_lander:
-            num_bundles = _math.ceil(num_legs / 3)
-            total += num_bundles * (self.config.lunar_lander_tip_lamports + self.BASE_TX_FEE_LAMPORTS)
+            total += self.config.lunar_lander_tip_lamports
         return total
 
     def _estimate_fees_usd(self, num_legs: int) -> float:
@@ -408,17 +408,21 @@ class LiveExecutor:
         self._keypair = Keypair.from_bytes(bytes(keypair_data))
         self._pubkey = str(self._keypair.pubkey())
         self.BASE_TX_FEE_LAMPORTS = 5000  # Solana base fee per signature
+
+        # Thread pool for background finalization checks
+        from concurrent.futures import ThreadPoolExecutor
+        self._recon_pool = ThreadPoolExecutor(max_workers=2,
+                                              thread_name_prefix="recon")
         logger.info(f"Live executor loaded wallet: {self._pubkey[:8]}..{self._pubkey[-4:]}")
 
-    def _estimate_fees_usd(self, num_legs: int, num_bundles: int = 1) -> float:
-        """Estimate total transaction fees in USD for a basket trade.
-        Each leg has base_fee + priority_fee, plus one tip per bundle."""
+    def _estimate_fees_usd(self, num_legs: int) -> float:
+        """Estimate total transaction fees in USD for one direction (entry or exit).
+        Fixed cost per bundle regardless of leg count."""
         if self.sol_usd_price <= 0:
             return 0.0
-        per_leg_lamports = self.BASE_TX_FEE_LAMPORTS + self.config.priority_fee_lamports
-        total_lamports = per_leg_lamports * num_legs
+        total_lamports = self.BASE_TX_FEE_LAMPORTS + self.config.priority_fee_lamports
         if self.config.use_lunar_lander:
-            total_lamports += (self.config.lunar_lander_tip_lamports + self.BASE_TX_FEE_LAMPORTS) * num_bundles
+            total_lamports += self.config.lunar_lander_tip_lamports
         return (total_lamports / 1e9) * self.sol_usd_price
 
     def _get_quote(self, input_mint: str, output_mint: str, amount_raw: int,
@@ -1077,8 +1081,6 @@ class LiveExecutor:
             sol_fills.append(fill)
             logger.info(f"Leg {idx + 1}/{signal.basket_size}: SOL leg (no swap needed) @ ${price:.4f}")
 
-        # Build all swap txs first, then submit in bundles of up to 3 swaps + 1 tip.
-        # This saves tip costs vs 1 swap + 1 tip per leg.
         loop = asyncio.get_running_loop()
 
         # SOL balance guard for entries (all legs spend SOL)
@@ -1098,41 +1100,39 @@ class LiveExecutor:
             except Exception as e:
                 logger.warning(f"Could not check SOL balance: {e}")
 
-        # Build all swap txs (quote + sign, no submit)
-        built_txs = []  # (idx, signed_b64, quote, sig_str, leg_data)
-        errors = []
-        for leg in legs:
-            idx, input_mint, output_mint, amount_raw, token_mint, side, qty, qty_raw, price_fb = leg
-            try:
-                signed_b64, quote, sig_str = await loop.run_in_executor(
-                    None, self._execute_swap_no_submit,
-                    input_mint, output_mint, amount_raw)
-                built_txs.append((idx, signed_b64, quote, sig_str, leg))
-                logger.info(f"Leg {idx + 1}/{signal.basket_size} built: {side} {token_mint[:8]}.. | sig: {sig_str[:20]}...")
-            except RuntimeError as e:
-                logger.error(f"Leg {idx + 1}/{signal.basket_size} quote/build failed: {e}")
-                errors.append(str(e))
-                break
-
-        if errors or not built_txs:
-            raise RuntimeError(f"Entry build failed: {'; '.join(errors)}")
-
-        # Submit in bundles of up to 3 swaps + 1 tip
-        max_swaps_per_bundle = 3
         fills = []
-        for group_start in range(0, len(built_txs), max_swaps_per_bundle):
-            group = built_txs[group_start:group_start + max_swaps_per_bundle]
-            tip_b64 = self._build_tip_tx()
-            bundle_b64 = [b64 for _, b64, _, _, _ in group] + [tip_b64]
-            group_names = [f"{leg[4][:8]}.." for _, _, _, _, leg in group]
+        errors = []
 
-            logger.info(f"Entry bundle: {len(group)} swaps + 1 tip ({', '.join(group_names)})")
+        if self.config.use_lunar_lander:
+            # Bundle mode: build all swap txs, submit in single bundle + 1 tip
+            built_txs = []
+            for leg in legs:
+                idx, input_mint, output_mint, amount_raw, token_mint, side, qty, qty_raw, price_fb = leg
+                try:
+                    signed_b64, quote, sig_str = await loop.run_in_executor(
+                        None, self._execute_swap_no_submit,
+                        input_mint, output_mint, amount_raw)
+                    built_txs.append((idx, signed_b64, quote, sig_str, leg))
+                    logger.info(f"Leg {idx + 1}/{signal.basket_size} built: {side} {token_mint[:8]}.. | sig: {sig_str[:20]}...")
+                except RuntimeError as e:
+                    logger.error(f"Leg {idx + 1}/{signal.basket_size} quote/build failed: {e}")
+                    errors.append(str(e))
+                    break
+
+            if errors or not built_txs:
+                raise RuntimeError(f"Entry build failed: {'; '.join(errors)}")
+
+            # Submit all swaps + 1 tip in a single bundle (max 4 swaps fits ≤4 token baskets)
+            tip_b64 = self._build_tip_tx()
+            bundle_b64 = [b64 for _, b64, _, _, _ in built_txs] + [tip_b64]
+            group_names = [f"{leg[4][:8]}.." for _, _, _, _, leg in built_txs]
+
+            logger.info(f"Entry bundle: {len(built_txs)} swaps + 1 tip ({', '.join(group_names)})")
             ok = self._submit_lunar_bundle(bundle_b64)
             if not ok:
                 raise RuntimeError(f"Entry bundle submit failed for {', '.join(group_names)}")
 
-            # Confirm each swap in the bundle
-            for idx, signed_b64, quote, sig_str, leg in group:
+            for idx, signed_b64, quote, sig_str, leg in built_txs:
                 _, _, _, _, token_mint, side, qty, qty_raw, price_fb = leg
                 confirmed, on_chain_err = self._confirm_transaction_sync(sig_str, timeout_s=60)
                 if on_chain_err:
@@ -1143,13 +1143,25 @@ class LiveExecutor:
                     errors.append(f"Leg {idx + 1} not confirmed after 60s")
                     logger.error(f"Leg {idx + 1}/{signal.basket_size} not confirmed (tx: {sig_str})")
                     break
-
                 fill = self._fill_from_quote(quote, token_mint, side, qty, qty_raw, price_fb, sig_str)
                 fills.append(fill)
                 logger.info(f"Leg {idx + 1}/{signal.basket_size} done: {side} {token_mint[:8]}.. @ ${fill.price:.6f}")
 
-            if errors:
-                break
+        else:
+            # SwQOS mode: submit each leg sequentially via sendTransaction (no bundles, no tips)
+            for leg in legs:
+                idx, input_mint, output_mint, amount_raw, token_mint, side, qty, qty_raw, price_fb = leg
+                try:
+                    fill, sig = await loop.run_in_executor(
+                        None, self._execute_swap_sync,
+                        input_mint, output_mint, amount_raw,
+                        token_mint, side, qty, qty_raw, price_fb)
+                    fills.append(fill)
+                    logger.info(f"Leg {idx + 1}/{signal.basket_size} done: {side} {token_mint[:8]}.. @ ${fill.price:.6f}")
+                except RuntimeError as e:
+                    logger.error(f"Leg {idx + 1}/{signal.basket_size} failed: {e}")
+                    errors.append(str(e))
+                    break
 
         # Merge SOL fills + swap fills
         fills = sol_fills + fills
@@ -1173,9 +1185,8 @@ class LiveExecutor:
                 self._sweep_tokens_batch_sync(sweep_list)
             raise RuntimeError(f"Partial entry — aborting: {'; '.join(errors)}")
 
-        num_bundles = (len(built_txs) + max_swaps_per_bundle - 1) // max_swaps_per_bundle
         return BasketExecution(fills=fills, is_paper=False,
-                               estimated_fees_usd=self._estimate_fees_usd(len(built_txs), num_bundles))
+                               estimated_fees_usd=self._estimate_fees_usd(len(legs)))
 
     async def execute_exit(self, position, prices: List[float],
                            other_position_mints: set = None) -> BasketExecution:
@@ -1208,18 +1219,14 @@ class LiveExecutor:
                 sol_fills.append((i, fill))
                 logger.info(f"Exit leg {i}: SOL leg (no swap needed) @ ${prices[i]:.4f}")
                 continue
-            # Use actual on-chain balance instead of recorded quantities_raw.
-            # The quote amount at entry may differ from actual on-chain receipt,
-            # so selling the recorded amount can leave orphaned dust.
+            # Use recorded position quantities, but cap at actual on-chain balance.
+            # We must NOT sell more than this position owns — other positions may
+            # hold the same token, and selling their balance corrupts their exits.
+            recorded_raw = position.quantities_raw[i]
+            recorded_qty = position.quantities[i]
             try:
-                actual_raw, actual_dec = self._get_token_balance_sync(position.mints[i])
-                actual_qty = actual_raw / 10**actual_dec if actual_dec > 0 else actual_raw
-                if actual_raw > 0:
-                    if actual_raw != position.quantities_raw[i]:
-                        logger.info(f"Exit leg {i} {position.mints[i][:8]}.. balance: "
-                                    f"{actual_raw} raw (recorded: {position.quantities_raw[i]}) — "
-                                    f"using actual on-chain balance")
-                else:
+                onchain_raw, onchain_dec = self._get_token_balance_sync(position.mints[i])
+                if onchain_raw == 0:
                     # Token already sold/swept — skip this leg entirely
                     logger.warning(f"Exit leg {i} {position.mints[i][:8]}.. has 0 on-chain balance — "
                                    f"already sold/swept, skipping")
@@ -1229,11 +1236,19 @@ class LiveExecutor:
                         slippage_bps=0, timestamp=int(time.time()),
                     ))
                     continue
+                # Sell the lesser of recorded amount and on-chain balance
+                actual_raw = min(recorded_raw, onchain_raw)
+                actual_dec_val = onchain_dec if onchain_dec > 0 else 9
+                actual_qty = actual_raw / 10**actual_dec_val
+                if actual_raw != recorded_raw:
+                    logger.info(f"Exit leg {i} {position.mints[i][:8]}.. "
+                                f"recorded: {recorded_raw}, on-chain: {onchain_raw} — "
+                                f"selling {actual_raw} (min of both)")
             except Exception as e:
                 logger.warning(f"Could not fetch on-chain balance for {position.mints[i][:8]}..: {e}, "
                                f"using recorded qty")
-                actual_raw = position.quantities_raw[i]
-                actual_qty = position.quantities[i]
+                actual_raw = recorded_raw
+                actual_qty = recorded_qty
             legs.append((position.mints[i], SOL_MINT, actual_raw,
                          position.mints[i], side, actual_qty,
                          actual_raw, prices[i]))
@@ -1244,64 +1259,73 @@ class LiveExecutor:
             all_fills = [f for _, f in sol_fills] + zero_balance_fills
             return BasketExecution(fills=all_fills, is_paper=False, estimated_fees_usd=0.0)
 
-        # Build all swap txs first, then submit in bundles of 3 swaps + 1 tip.
         loop = asyncio.get_running_loop()
-        built_txs = []  # (i, signed_b64, quote, sig_str, leg)
-        build_failures = []
-
-        for i, leg in enumerate(legs):
-            input_mint, output_mint, amount_raw, token_mint, side, qty, qty_raw, price_fb = leg
-            try:
-                signed_b64, quote, sig_str = await loop.run_in_executor(
-                    None, self._execute_swap_no_submit,
-                    input_mint, output_mint, amount_raw)
-                built_txs.append((i, signed_b64, quote, sig_str, leg))
-                logger.info(f"Exit leg {i} built: {token_mint[:8]}.. | sig: {sig_str[:20]}...")
-            except RuntimeError as e:
-                logger.error(f"Exit leg {i} {token_mint[:8]}.. build failed: {e}")
-                build_failures.append((i, leg, str(e)))
-
-        # Submit built txs in bundles of up to 3 swaps + 1 tip
-        max_swaps_per_bundle = 3
         swap_fills = []
         confirmed_mints = set()
-        errors = []
+        build_failures = []
 
-        for group_start in range(0, len(built_txs), max_swaps_per_bundle):
-            group = built_txs[group_start:group_start + max_swaps_per_bundle]
-            tip_b64 = self._build_tip_tx()
-            bundle_b64 = [b64 for _, b64, _, _, _ in group] + [tip_b64]
-            group_names = [leg[3][:8] + ".." for _, _, _, _, leg in group]
-
-            logger.info(f"Exit bundle: {len(group)} swaps + 1 tip ({', '.join(group_names)})")
-            ok = self._submit_lunar_bundle(bundle_b64)
-            if not ok:
-                logger.error(f"Exit bundle submit failed for {', '.join(group_names)}")
-                for i, _, _, _, leg in group:
-                    build_failures.append((i, leg, "bundle submit failed"))
-                continue
-
-            # Confirm each swap
-            for i, signed_b64, quote, sig_str, leg in group:
+        if self.config.use_lunar_lander:
+            # Bundle mode: build all swap txs, submit in single bundle + 1 tip
+            built_txs = []
+            for i, leg in enumerate(legs):
                 input_mint, output_mint, amount_raw, token_mint, side, qty, qty_raw, price_fb = leg
-                confirmed, on_chain_err = self._confirm_transaction_sync(sig_str, timeout_s=60)
-                if confirmed:
-                    fill = self._fill_from_quote(quote, token_mint, side, qty, qty_raw, price_fb, sig_str)
+                try:
+                    signed_b64, quote, sig_str = await loop.run_in_executor(
+                        None, self._execute_swap_no_submit,
+                        input_mint, output_mint, amount_raw)
+                    built_txs.append((i, signed_b64, quote, sig_str, leg))
+                    logger.info(f"Exit leg {i} built: {token_mint[:8]}.. | sig: {sig_str[:20]}...")
+                except RuntimeError as e:
+                    logger.error(f"Exit leg {i} {token_mint[:8]}.. build failed: {e}")
+                    build_failures.append((i, leg, str(e)))
+
+            if built_txs:
+                tip_b64 = self._build_tip_tx()
+                bundle_b64 = [b64 for _, b64, _, _, _ in built_txs] + [tip_b64]
+                group_names = [leg[3][:8] + ".." for _, _, _, _, leg in built_txs]
+
+                logger.info(f"Exit bundle: {len(built_txs)} swaps + 1 tip ({', '.join(group_names)})")
+                ok = self._submit_lunar_bundle(bundle_b64)
+                if not ok:
+                    logger.error(f"Exit bundle submit failed for {', '.join(group_names)}")
+                    for i, _, _, _, leg in built_txs:
+                        build_failures.append((i, leg, "bundle submit failed"))
+                else:
+                    for i, signed_b64, quote, sig_str, leg in built_txs:
+                        input_mint, output_mint, amount_raw, token_mint, side, qty, qty_raw, price_fb = leg
+                        confirmed, on_chain_err = self._confirm_transaction_sync(sig_str, timeout_s=60)
+                        if confirmed:
+                            fill = self._fill_from_quote(quote, token_mint, side, qty, qty_raw, price_fb, sig_str)
+                            swap_fills.append(fill)
+                            confirmed_mints.add(token_mint)
+                            logger.info(f"Exit leg {i} done: {token_mint[:8]}.. @ ${fill.price:.6f}")
+                        else:
+                            err_msg = on_chain_err or "timeout"
+                            logger.error(f"Exit leg {i} {token_mint[:8]}.. failed: {err_msg}")
+                            build_failures.append((i, leg, err_msg))
+
+        else:
+            # SwQOS mode: submit each leg sequentially via sendTransaction (no bundles, no tips)
+            for i, leg in enumerate(legs):
+                input_mint, output_mint, amount_raw, token_mint, side, qty, qty_raw, price_fb = leg
+                try:
+                    fill, sig = await loop.run_in_executor(
+                        None, self._execute_swap_sync,
+                        input_mint, output_mint, amount_raw,
+                        token_mint, side, qty, qty_raw, price_fb)
                     swap_fills.append(fill)
                     confirmed_mints.add(token_mint)
                     logger.info(f"Exit leg {i} done: {token_mint[:8]}.. @ ${fill.price:.6f}")
-                else:
-                    err_msg = on_chain_err or "timeout"
-                    logger.error(f"Exit leg {i} {token_mint[:8]}.. failed: {err_msg}")
-                    build_failures.append((i, leg, err_msg))
+                except RuntimeError as e:
+                    logger.error(f"Exit leg {i} {token_mint[:8]}.. failed: {e}")
+                    build_failures.append((i, leg, str(e)))
 
         # Handle failures: sweep any unsold tokens
         unsold_tokens = []
         for i, leg, err in build_failures:
             input_mint, output_mint, amount_raw, token_mint, side, qty, qty_raw, price_fb = leg
             if token_mint in confirmed_mints:
-                continue  # already sold in a successful bundle
-            # Try individual sweep with escalating slippage
+                continue  # already sold successfully
             swept = False
             try:
                 bal_raw, _ = self._get_token_balance_sync(token_mint)
@@ -1312,7 +1336,6 @@ class LiveExecutor:
                 logger.error(f"Sweep fallback error for {token_mint[:8]}..: {e}")
 
             if swept:
-                # Add paper fill for P&L accounting
                 swap_fills.append(Fill(
                     token_mint=token_mint, side=side, price=price_fb,
                     quantity=qty, quantity_raw=qty_raw,
@@ -1355,10 +1378,8 @@ class LiveExecutor:
         # Merge SOL fills + zero-balance fills + swap fills
         fills = [f for _, f in sol_fills] + zero_balance_fills + swap_fills
 
-        num_swap_legs = len([f for f in swap_fills if f.tx_signature])
-        num_bundles = max(1, (num_swap_legs + max_swaps_per_bundle - 1) // max_swaps_per_bundle)
         return BasketExecution(fills=fills, is_paper=False,
-                               estimated_fees_usd=self._estimate_fees_usd(num_swap_legs, num_bundles))
+                               estimated_fees_usd=self._estimate_fees_usd(len(legs)))
 
     def _rpc_call_sync(self, method, params):
         """Synchronous JSON-RPC call (for use in background threads)."""
@@ -1456,6 +1477,13 @@ class LiveExecutor:
         """Get wallet SOL balance in SOL units. Synchronous."""
         result = self._rpc_call_sync("getBalance", [self._pubkey])
         return result["result"]["value"] / 1e9
+
+    def get_sol_balance_and_slot_sync(self):
+        """Get wallet SOL balance and current slot. Returns (sol_balance, slot)."""
+        result = self._rpc_call_sync("getBalance", [self._pubkey])
+        sol = result["result"]["value"] / 1e9
+        slot = result["result"].get("context", {}).get("slot", 0)
+        return sol, slot
 
     def get_all_token_mints_sync(self):
         """Get all non-SOL token mints with balance in the wallet.
@@ -1570,6 +1598,78 @@ class LiveExecutor:
         elif swept_count > 0:
             logger.info(f"Swept {swept_count} tokens but SOL balance unchanged "
                         f"(before={sol_before:.6f}, after={sol_after:.6f})")
+
+    def record_exit_reconciliation(self, position_id: int, pair_key: str,
+                                    sol_before: float, slot_before: int,
+                                    expected_pnl: float,
+                                    execution: BasketExecution):
+        """Save exit reconciliation record and spawn background finalization checker."""
+        signatures = [f.tx_signature for f in execution.fills if f.tx_signature]
+        if not signatures:
+            return
+
+        rec_id = self.db.save_exit_reconciliation(
+            position_id=position_id,
+            pair_key=pair_key,
+            sol_before=sol_before,
+            slot_before=slot_before,
+            expected_pnl=expected_pnl,
+            signatures=signatures,
+        )
+
+        logger.info(f"Exit reconciliation #{rec_id}: sol_before={sol_before:.6f} "
+                     f"slot={slot_before} expected_pnl=${expected_pnl:+.4f} sigs={len(signatures)}")
+
+        self._recon_pool.submit(self._wait_finalization, rec_id, signatures)
+
+    def _wait_finalization(self, rec_id: int, signatures: list):
+        """Background thread: poll until all signatures are finalized,
+        then record the on-chain SOL balance and finalized slot."""
+        import sqlite3
+
+        deadline = time.time() + 120  # 2 min timeout
+        pending = set(signatures)
+        last_finalized_slot = 0
+
+        while pending and time.time() < deadline:
+            time.sleep(1)
+            for sig in list(pending):
+                try:
+                    result = self._rpc_call_sync("getSignatureStatuses",
+                                                 [[sig], {"searchTransactionHistory": True}])
+                    statuses = result.get("result", {}).get("value", [])
+                    if statuses and statuses[0]:
+                        status = statuses[0].get("confirmationStatus")
+                        if status == "finalized":
+                            sig_slot = statuses[0].get("slot", 0)
+                            last_finalized_slot = max(last_finalized_slot, sig_slot)
+                            pending.discard(sig)
+                except Exception:
+                    pass
+
+        try:
+            sol_after, balance_slot = self.get_sol_balance_and_slot_sync()
+            slot_after = last_finalized_slot if last_finalized_slot > 0 else balance_slot
+
+            # Use a thread-local connection for DB write
+            conn = sqlite3.connect(self.db.db_path, check_same_thread=False)
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute(
+                "UPDATE exit_reconciliation SET sol_after = ?, slot_after = ?, finalized_at = ? "
+                "WHERE id = ?",
+                (sol_after, slot_after, time.time(), rec_id),
+            )
+            conn.commit()
+            conn.close()
+
+            if pending:
+                logger.warning(f"Reconciliation #{rec_id}: {len(pending)} sig(s) not finalized "
+                               f"after timeout, sol_after={sol_after:.6f} slot={slot_after}")
+            else:
+                logger.info(f"Reconciliation #{rec_id}: finalized at slot {slot_after}, "
+                            f"sol_after={sol_after:.6f}")
+        except Exception as e:
+            logger.warning(f"Reconciliation #{rec_id} failed: {e}")
 
     def log_execution(self, position_id: int, execution: BasketExecution, slot: int):
         """Persist all fills to the execution_log table."""

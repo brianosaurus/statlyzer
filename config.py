@@ -88,3 +88,8 @@ class Config:
 
     # Token whitelist: if set, only trade baskets where ALL mints are in this set
     token_whitelist_mints: set = None  # populated from --token-whitelist CLI arg
+
+    # Reinforcement learning
+    rl_model_path: str = os.getenv('RL_MODEL_PATH', 'rl_model')
+    rl_hidden_dim: int = int(os.getenv('RL_HIDDEN_DIM', '64'))
+    rl_learning_rate: float = float(os.getenv('RL_LEARNING_RATE', '0.0003'))

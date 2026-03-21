@@ -91,9 +91,15 @@ def parse_args():
                         help='Max new positions per hour (default: 5)')
     parser.add_argument('--no-paper-errors', action='store_true',
                         help='Disable paper leg failures and latency rejections')
+    parser.add_argument('--lunar-lander', action='store_true',
+                        help='Enable Lunar Lander fee model (embedded tip per bundle)')
+    parser.add_argument('--no-lunar-lander', action='store_true',
+                        help='Disable Lunar Lander fee model (SwQOS mode)')
     parser.add_argument('--token-whitelist', type=str, default=None,
                         help='Only trade baskets where ALL tokens are in this comma-separated list '
                              '(e.g. bSOL,mSOL,jitoSOL,jupSOL,BONK)')
+    parser.add_argument('--rl', action='store_true',
+                        help='Enable RL agent for entry/exit decisions (learns to maximize $/day)')
     parser.add_argument('--verbose', action='store_true',
                         help='Enable debug logging')
     return parser.parse_args()
@@ -141,6 +147,10 @@ def apply_overrides(config: Config, args):
         config.paper_leg_failure_pct = 0.0
         config.paper_latency_mean_s = 0.0
         config.paper_latency_std_s = 0.0
+    if args.lunar_lander:
+        config.use_lunar_lander = True
+    if args.no_lunar_lander:
+        config.use_lunar_lander = False
     if args.token_whitelist:
         from constants import WELL_KNOWN_TOKENS
         symbol_to_mint = {v['symbol']: k for k, v in WELL_KNOWN_TOKENS.items()}
@@ -191,6 +201,34 @@ def show_status(config: Config, db_path: str):
     db.close()
 
 
+def _get_sol_before(config, executor) -> tuple:
+    """Get SOL balance and slot before a live exit. Returns (0.0, 0) for paper mode."""
+    if config.paper_trade:
+        return 0.0, 0
+    try:
+        return executor.get_sol_balance_and_slot_sync()
+    except Exception as e:
+        logger.warning(f"Could not get SOL balance before exit: {e}")
+        return 0.0, 0
+
+
+def _record_exit_recon(config, executor, closed, execution,
+                       sol_before: float, slot_before: int):
+    """Record exit reconciliation for live trades."""
+    if config.paper_trade or sol_before <= 0 or closed is None:
+        return
+    if not hasattr(executor, 'record_exit_reconciliation'):
+        return
+    executor.record_exit_reconciliation(
+        position_id=closed.id,
+        pair_key=closed.pair_key,
+        sol_before=sol_before,
+        slot_before=slot_before,
+        expected_pnl=closed.realized_pnl,
+        execution=execution,
+    )
+
+
 async def run_monitor(config: Config, args):
     """Main monitoring and trading loop."""
     # Initialize executor first (live mode needs wallet balance before portfolio)
@@ -232,6 +270,13 @@ async def run_monitor(config: Config, args):
     portfolio = PortfolioManager(config, db)
     risk_mgr = RiskManager(config, portfolio)
     sizer = PositionSizer(config)
+
+    # RL agent (optional)
+    rl = None
+    if args.rl:
+        from rl_agent import RLDecisionMaker
+        rl = RLDecisionMaker(config, db)
+        logger.info(f"RL agent enabled: {rl.status_str()}")
 
     # Load cointegrated baskets
     num_pairs = signal_gen.load_baskets()
@@ -299,6 +344,7 @@ async def run_monitor(config: Config, args):
                 exit_prices = [_prefetch_prices.get(m, pos.current_prices[i])
                                for i, m in enumerate(pos.mints)]
                 other_mints = {m for pk, p in portfolio.positions.items() if pk != pair_key for m in p.mints}
+                sol_before, slot_before = _get_sol_before(config, executor)
                 try:
                     execution = await executor.execute_exit(pos, exit_prices, other_position_mints=other_mints)
                 except Exception as e:
@@ -310,11 +356,16 @@ async def run_monitor(config: Config, args):
                                                   exit_fees_usd=execution.estimated_fees_usd)
                 if closed:
                     executor.log_execution(closed.id, execution, 0)
+                    _record_exit_recon(config, executor, closed, execution, sol_before, slot_before)
                     basket_state = signal_gen.get_basket_states().get(pair_key)
                     if basket_state:
                         basket_state.in_position = False
                     print(f"    Closed {unwanted} {pair_key[:16]}.. P&L: ${closed.realized_pnl:+.2f}")
 
+
+    # Recover pending RL decisions for open positions
+    if rl and portfolio.positions:
+        rl.load_pending_from_db(set(portfolio.positions.keys()))
 
     # Persist initial capital
     portfolio.save_capital()
@@ -392,8 +443,10 @@ async def run_monitor(config: Config, args):
     deadline = start_time + args.duration * 60 if args.duration else None
     last_dashboard = 0
     last_snapshot = 0
+    last_rl_train = 0
     snapshot_interval = 300  # 5 minutes
     dashboard_interval = 60  # 1 minute
+    rl_train_interval = 600  # 10 minutes
 
     try:
         async for prices in feed.poll():
@@ -434,6 +487,18 @@ async def run_monitor(config: Config, args):
                     if not risk_check.allowed:
                         continue
 
+                    # RL entry decision (if enabled)
+                    rl_size_mult = 1.0
+                    if rl is not None:
+                        from rl_agent import ACTION_PASS
+                        rl_action = rl.decide_entry(sig, basket_state, portfolio, risk_mgr)
+                        if rl_action == ACTION_PASS:
+                            rl.on_entry_skipped(sig, basket_state, portfolio, risk_mgr)
+                            db.save_signal(sig, acted_on=False, reason="RL: PASS")
+                            continue
+                        from rl_agent import SIZE_MULTIPLIERS
+                        rl_size_mult = SIZE_MULTIPLIERS.get(rl_action, 1.0)
+
                     # Get current prices for all mints in basket
                     entry_prices = [signal_gen.token_prices.get(m, 0) for m in sig.mints]
                     if any(p <= 0 for p in entry_prices):
@@ -445,6 +510,13 @@ async def run_monitor(config: Config, args):
                     size = sizer.compute_size(sig, portfolio_value, exposure, entry_prices)
                     if size is None:
                         continue
+
+                    # Apply RL size multiplier
+                    if rl is not None and rl_size_mult != 1.0:
+                        size.amounts = [a * rl_size_mult for a in size.amounts]
+                        size.amounts_raw = [max(1, int(r * rl_size_mult)) for r in size.amounts_raw]
+                        size.dollar_amounts = [d * rl_size_mult for d in size.dollar_amounts]
+                        size.total_exposure_usd *= rl_size_mult
 
                     # Paper realism: simulate execution latency + z-score decay
                     if hasattr(executor, 'simulate_latency'):
@@ -499,6 +571,15 @@ async def run_monitor(config: Config, args):
 
                     position = portfolio.positions[sig.pair_key]
 
+                    # RL exit decision (only for EXIT signals, not STOP_LOSS)
+                    if rl is not None and sig.signal_type == SignalType.EXIT:
+                        exit_basket_state = signal_gen.get_basket_states().get(sig.pair_key)
+                        should_exit = rl.decide_exit(
+                            sig, exit_basket_state, portfolio, risk_mgr, position)
+                        if not should_exit:
+                            db.save_signal(sig, acted_on=False, reason="RL: HOLD")
+                            continue
+
                     # Min P&L filter: don't exit mean-reversion at a loss unless
                     # z has fully crossed zero (strong reversion) or stop loss
                     if sig.signal_type == SignalType.EXIT and position.unrealized_pnl < 0:
@@ -517,6 +598,8 @@ async def run_monitor(config: Config, args):
                                    for i, m in enumerate(position.mints)]
 
                     other_mints = {m for pk, p in portfolio.positions.items() if pk != sig.pair_key for m in p.mints}
+
+                    sol_before, slot_before = _get_sol_before(config, executor)
                     try:
                         execution = await executor.execute_exit(position, exit_prices, other_position_mints=other_mints)
                     except Exception as e:
@@ -531,11 +614,19 @@ async def run_monitor(config: Config, args):
                                                       exit_fees_usd=execution.estimated_fees_usd)
                     if closed:
                         executor.log_execution(closed.id, execution, 0)
+                        _record_exit_recon(config, executor, closed, execution, sol_before, slot_before)
+
+                        # RL reward feedback
+                        if rl is not None:
+                            entry_val = sum(closed.entry_values) if closed.entry_values else 1.0
+                            dur_hrs = max((closed.exit_time - closed.entry_time) / 3600, 0.01)
+                            rl.on_position_closed(sig.pair_key, closed.realized_pnl,
+                                                  entry_val, dur_hrs)
                         basket_state = signal_gen.get_basket_states().get(sig.pair_key)
                         if basket_state:
                             basket_state.in_position = False
                         print_exit(closed, reason)
-    
+
 
             # Mark-to-market using Jupiter prices directly
             portfolio.mark_to_market(signal_gen.token_prices)
@@ -568,6 +659,7 @@ async def run_monitor(config: Config, args):
                     exit_prices = [signal_gen.token_prices.get(m, pos.current_prices[i])
                                    for i, m in enumerate(pos.mints)]
                     other_mints = {m for pk, p in portfolio.positions.items() if pk != pair_key for m in p.mints}
+                    sol_before, slot_before = _get_sol_before(config, executor)
                     try:
                         execution = await executor.execute_exit(pos, exit_prices, other_position_mints=other_mints)
                     except Exception as e:
@@ -579,11 +671,16 @@ async def run_monitor(config: Config, args):
                                                       exit_fees_usd=execution.estimated_fees_usd)
                     if closed:
                         executor.log_execution(closed.id, execution, 0)
+                        _record_exit_recon(config, executor, closed, execution, sol_before, slot_before)
+                        if rl is not None:
+                            entry_val = sum(closed.entry_values) if closed.entry_values else 1.0
+                            dur_hrs = max((closed.exit_time - closed.entry_time) / 3600, 0.01)
+                            rl.on_position_closed(pair_key, closed.realized_pnl, entry_val, dur_hrs)
                         basket_state = signal_gen.get_basket_states().get(pair_key)
                         if basket_state:
                             basket_state.in_position = False
                         print_exit(closed, f"dollar_stop (lost >{config.max_position_loss_pct:.0%})")
-    
+
 
             # Time-based exit: close positions older than N half-lives
             now = int(time.time())
@@ -601,6 +698,7 @@ async def run_monitor(config: Config, args):
                     exit_prices = [signal_gen.token_prices.get(m, pos.current_prices[i])
                                    for i, m in enumerate(pos.mints)]
                     other_mints = {m for pk, p in portfolio.positions.items() if pk != pair_key for m in p.mints}
+                    sol_before, slot_before = _get_sol_before(config, executor)
                     try:
                         execution = await executor.execute_exit(pos, exit_prices, other_position_mints=other_mints)
                     except Exception as e:
@@ -612,6 +710,11 @@ async def run_monitor(config: Config, args):
                                                       exit_fees_usd=execution.estimated_fees_usd)
                     if closed:
                         executor.log_execution(closed.id, execution, 0)
+                        _record_exit_recon(config, executor, closed, execution, sol_before, slot_before)
+                        if rl is not None:
+                            entry_val = sum(closed.entry_values) if closed.entry_values else 1.0
+                            dur_hrs = max((closed.exit_time - closed.entry_time) / 3600, 0.01)
+                            rl.on_position_closed(pair_key, closed.realized_pnl, entry_val, dur_hrs)
                         if basket_state:
                             basket_state.in_position = False
                         print_exit(closed, f"time_exit ({age:.0f}s > {max_age:.0f}s = {config.max_position_age_half_lives}x HL)")
@@ -631,6 +734,7 @@ async def run_monitor(config: Config, args):
                         p = pos.entry_prices[i]
                     exit_prices.append(p)
                 other_mints = {m for pk, p in portfolio.positions.items() if pk != pair_key for m in p.mints}
+                sol_before, slot_before = _get_sol_before(config, executor)
                 try:
                     execution = await executor.execute_exit(pos, exit_prices, other_position_mints=other_mints)
                 except Exception as e:
@@ -642,6 +746,11 @@ async def run_monitor(config: Config, args):
                                                   exit_fees_usd=execution.estimated_fees_usd)
                 if closed:
                     executor.log_execution(closed.id, execution, 0)
+                    _record_exit_recon(config, executor, closed, execution, sol_before, slot_before)
+                    if rl is not None:
+                        entry_val = sum(closed.entry_values) if closed.entry_values else 1.0
+                        dur_hrs = max((closed.exit_time - closed.entry_time) / 3600, 0.01)
+                        rl.on_position_closed(pair_key, closed.realized_pnl, entry_val, dur_hrs)
                     print_exit(closed, "orphan_cleanup (basket no longer monitored)")
 
 
@@ -666,12 +775,20 @@ async def run_monitor(config: Config, args):
                 print_positions(portfolio.positions, portfolio.get_total_value(),
                                 signal_gen.get_basket_states(), config.max_position_age_half_lives)
                 print_discovery_status(signal_gen.discovery)
+                if rl is not None:
+                    print(f"  RL: {rl.status_str()}")
                 last_dashboard = now_f
 
             # Periodic snapshot
             if now_f - last_snapshot > snapshot_interval:
                 portfolio.take_snapshot()
                 last_snapshot = now_f
+
+            # RL periodic training
+            if rl is not None and now_f - last_rl_train > rl_train_interval:
+                if rl.maybe_train():
+                    logger.info(f"RL trained: {rl.status_str()}")
+                last_rl_train = now_f
 
             # Persist discovered pairs to DB for crash recovery
             if now_f - last_discovery_save > 60:

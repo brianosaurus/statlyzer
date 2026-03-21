@@ -133,6 +133,20 @@ class Database:
                 confirmation_timestamp REAL
             );
 
+            CREATE TABLE IF NOT EXISTS sol_balance_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                position_id INTEGER,
+                action TEXT NOT NULL,
+                sol_before REAL NOT NULL,
+                sol_after REAL NOT NULL,
+                expected_sol_after REAL,
+                diff REAL,
+                pair_key TEXT,
+                timestamp INTEGER NOT NULL,
+                FOREIGN KEY (position_id) REFERENCES positions(id)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_sol_balance_pos ON sol_balance_log(position_id);
             CREATE INDEX IF NOT EXISTS idx_transactions_sig ON transactions(signature);
             CREATE INDEX IF NOT EXISTS idx_signals_pair ON signals(pair_key);
             CREATE INDEX IF NOT EXISTS idx_signals_time ON signals(timestamp);
@@ -140,6 +154,36 @@ class Database:
             CREATE INDEX IF NOT EXISTS idx_positions_pair ON positions(pair_key);
             CREATE INDEX IF NOT EXISTS idx_exec_position ON execution_log(position_id);
             CREATE INDEX IF NOT EXISTS idx_candles_pair_time ON price_candles(basket_key, timestamp);
+
+            CREATE TABLE IF NOT EXISTS exit_reconciliation (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                position_id INTEGER NOT NULL,
+                pair_key TEXT NOT NULL,
+                sol_before REAL NOT NULL,
+                slot_before INTEGER NOT NULL DEFAULT 0,
+                expected_pnl REAL NOT NULL,
+                signatures_json TEXT NOT NULL,
+                sol_after REAL,
+                slot_after INTEGER,
+                finalized_at REAL,
+                created_at REAL NOT NULL,
+                FOREIGN KEY (position_id) REFERENCES positions(id)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_exit_recon_pos ON exit_reconciliation(position_id);
+
+            CREATE TABLE IF NOT EXISTS rl_experiences (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                pair_key TEXT NOT NULL,
+                observation_json TEXT NOT NULL,
+                action INTEGER NOT NULL,
+                log_prob REAL NOT NULL,
+                value REAL NOT NULL,
+                context TEXT NOT NULL DEFAULT 'entry',
+                reward REAL,
+                done INTEGER NOT NULL DEFAULT 0,
+                timestamp REAL NOT NULL
+            );
         """)
         self.conn.commit()
 
@@ -437,6 +481,72 @@ class Database:
             "UPDATE transactions SET confirmation_slot = ?, confirmation_timestamp = ? WHERE signature = ?",
             (confirmation_slot, confirmation_timestamp, signature),
         )
+        self.conn.commit()
+
+    def save_sol_balance(self, position_id: int, action: str,
+                         sol_before: float, sol_after: float,
+                         expected_sol_after: float, pair_key: str) -> None:
+        self.conn.execute(
+            """INSERT INTO sol_balance_log
+               (position_id, action, sol_before, sol_after, expected_sol_after,
+                diff, pair_key, timestamp)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            (position_id, action, sol_before, sol_after, expected_sol_after,
+             sol_after - expected_sol_after if expected_sol_after is not None else None,
+             pair_key, int(time.time())),
+        )
+        self.conn.commit()
+
+    # --- Exit reconciliation ---
+
+    def save_exit_reconciliation(self, position_id: int, pair_key: str,
+                                 sol_before: float, slot_before: int,
+                                 expected_pnl: float,
+                                 signatures: list) -> int:
+        cursor = self.conn.execute(
+            """INSERT INTO exit_reconciliation
+               (position_id, pair_key, sol_before, slot_before, expected_pnl,
+                signatures_json, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            (position_id, pair_key, sol_before, slot_before, expected_pnl,
+             json.dumps(signatures), time.time()),
+        )
+        self.conn.commit()
+        return cursor.lastrowid
+
+    # --- RL experience persistence ---
+
+    def save_rl_experience(self, pair_key: str, observation_json: str,
+                           action: int, log_prob: float, value: float,
+                           context: str = 'entry') -> None:
+        """Save or update a pending RL experience for crash recovery."""
+        self.conn.execute(
+            """INSERT INTO rl_experiences
+               (pair_key, observation_json, action, log_prob, value, context,
+                done, timestamp)
+               VALUES (?, ?, ?, ?, ?, ?, 0, ?)
+               ON CONFLICT(id) DO UPDATE SET
+                observation_json=excluded.observation_json,
+                action=excluded.action, log_prob=excluded.log_prob,
+                value=excluded.value, timestamp=excluded.timestamp""",
+            (pair_key, observation_json, action, log_prob, value, context,
+             time.time()),
+        )
+        self.conn.commit()
+
+    def load_rl_experiences(self) -> List[Dict]:
+        """Load pending (undone) RL experiences."""
+        rows = self.conn.execute(
+            "SELECT pair_key, observation_json, action, log_prob, value, context "
+            "FROM rl_experiences WHERE done = 0"
+        ).fetchall()
+        return [{'pair_key': r[0], 'observation_json': r[1], 'action': r[2],
+                 'log_prob': r[3], 'value': r[4], 'context': r[5]}
+                for r in rows]
+
+    def clear_rl_experiences(self) -> None:
+        """Clear all RL experiences (after training)."""
+        self.conn.execute("DELETE FROM rl_experiences")
         self.conn.commit()
 
     def close(self):

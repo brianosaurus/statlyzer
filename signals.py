@@ -73,6 +73,53 @@ class CircularBuffer:
         return self.data[idx]
 
 
+class SpreadKalmanFilter:
+    """1-D Kalman filter for spread denoising.
+
+    State model: spread follows a random walk (process noise Q).
+    Observation model: observed spread = true spread + noise (measurement noise R).
+
+    Q controls how quickly the filter adapts to real spread changes.
+    R controls how much it trusts each new observation.
+    Higher R/Q ratio = more smoothing.
+    """
+
+    def __init__(self, process_noise: float = 1e-5, measurement_noise: float = 1e-3):
+        self.Q = process_noise       # process noise variance
+        self.R = measurement_noise   # measurement noise variance
+        self.x = 0.0                 # state estimate (filtered spread)
+        self.P = 1.0                 # estimate uncertainty
+        self.initialized = False
+
+    def update(self, observation: float) -> float:
+        """Feed a new spread observation, return filtered spread."""
+        if not self.initialized:
+            self.x = observation
+            self.P = self.R
+            self.initialized = True
+            return self.x
+
+        # Predict
+        x_pred = self.x
+        P_pred = self.P + self.Q
+
+        # Update
+        K = P_pred / (P_pred + self.R)    # Kalman gain
+        self.x = x_pred + K * (observation - x_pred)
+        self.P = (1 - K) * P_pred
+
+        return self.x
+
+    def filter_live(self, observation: float) -> float:
+        """Get filtered value for a live observation without updating state.
+        Used for tick-level z-score between candle resamples."""
+        if not self.initialized:
+            return observation
+        P_pred = self.P + self.Q
+        K = P_pred / (P_pred + self.R)
+        return self.x + K * (observation - self.x)
+
+
 @dataclass
 class BasketState:
     """Tracks rolling price window and cointegration params for one basket."""
@@ -101,9 +148,16 @@ class BasketState:
     pending_prices: List[float] = field(default=None, repr=False)
     last_resample_time: float = 0.0
 
+    # Kalman filter for spread denoising
+    kalman: Optional[SpreadKalmanFilter] = field(default=None, repr=False)
+
+    # Stop-loss confirmation: require N consecutive ticks above threshold
+    stop_loss_ticks: int = 0
+
     def init_buffers(self, capacity: int):
         self.price_buffers = [CircularBuffer(capacity) for _ in range(self.basket_size)]
         self.pending_prices = [0.0] * self.basket_size
+        self.kalman = SpreadKalmanFilter()
 
 
 def make_basket_key(mints: List[str]) -> str:
@@ -460,7 +514,14 @@ class SignalGenerator:
         hr = np.array(basket.hedge_ratios)       # (N,)
         spread = price_matrix @ hr               # (T,)
 
-        basket.current_spread = float(spread[-1])
+        # Kalman-filter the latest spread observation
+        raw_spread = float(spread[-1])
+        if basket.kalman is not None:
+            filtered_spread = basket.kalman.update(raw_spread)
+        else:
+            filtered_spread = raw_spread
+
+        basket.current_spread = filtered_spread
         basket.spread_mean = float(np.mean(spread))
         basket.spread_std = float(np.std(spread))
 
@@ -505,7 +566,8 @@ class SignalGenerator:
     def _compute_zscore_live(self, basket: BasketState):
         """Compute a live z-score using buffer + pending (tick-level) prices.
         Updates basket.current_zscore and basket.current_spread.
-        Exit/stop signals are checked against this live z-score between resamples."""
+        Exit/stop signals are checked against this live z-score between resamples.
+        Uses Kalman filter_live() to denoise without committing state."""
         if any(p <= 0 for p in basket.pending_prices):
             return
         arrays = [buf.get_array() for buf in basket.price_buffers]
@@ -520,7 +582,14 @@ class SignalGenerator:
             return
         # Current spread using pending (live) prices
         live_log_prices = np.array([np.log(p) for p in basket.pending_prices])
-        live_spread = float(live_log_prices @ hr)
+        raw_live_spread = float(live_log_prices @ hr)
+
+        # Kalman-denoise the live spread (peek without committing state)
+        if basket.kalman is not None and basket.kalman.initialized:
+            live_spread = basket.kalman.filter_live(raw_live_spread)
+        else:
+            live_spread = raw_live_spread
+
         z = (live_spread - mean) / std
         if abs(z) > 100:
             return  # degenerate — don't display garbage
@@ -532,9 +601,17 @@ class SignalGenerator:
 
         if abs(z) > self.config.stop_loss_zscore:
             if basket.in_position:
-                return SignalType.STOP_LOSS
+                # Require 3 consecutive ticks above stop threshold to confirm
+                basket.stop_loss_ticks += 1
+                if basket.stop_loss_ticks >= 3:
+                    basket.stop_loss_ticks = 0
+                    return SignalType.STOP_LOSS
+                return None
             return None
-        elif z < -self.config.entry_zscore:
+        else:
+            basket.stop_loss_ticks = 0  # reset counter when z drops below
+
+        if z < -self.config.entry_zscore:
             if not basket.in_position:
                 return SignalType.ENTRY_LONG
         elif z > self.config.entry_zscore:
