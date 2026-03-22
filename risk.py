@@ -20,9 +20,10 @@ class RiskCheck:
 class RiskManager:
     """Evaluates risk before allowing new positions."""
 
-    def __init__(self, config, portfolio):
+    def __init__(self, config, portfolio, slippage_monitor=None):
         self.config = config
         self.portfolio = portfolio
+        self.slippage_monitor = slippage_monitor
         self.entries_this_hour: list = []  # timestamps
         self.kill_switch: bool = False
         self.kill_switch_time: float = 0  # when kill switch was engaged
@@ -59,18 +60,26 @@ class RiskManager:
             return RiskCheck(False, f"Max positions ({self.config.max_positions}) reached")
 
         # 3b. Concentration limit — max positions sharing a token
-        # Exempt stablecoins (USDC etc.) since they're the quote currency for every pair
-        from constants import STABLECOIN_MINTS
-        max_per_token = self.config.max_positions_per_token
+        # Per-token limits based on liquidity tier (deep liquidity = higher limit)
+        from constants import STABLECOIN_MINTS, TOKEN_LIQUIDITY_TIER
+        base_max = self.config.max_positions_per_token
         for mint in signal.mints:
             if mint in STABLECOIN_MINTS:
                 continue
+            tier_mult = TOKEN_LIQUIDITY_TIER.get(mint, 1.0)
+            max_for_token = int(base_max * tier_mult)
             count = sum(
                 1 for p in self.portfolio.positions.values()
                 if mint in p.mints
             )
-            if count >= max_per_token:
-                return RiskCheck(False, f"Concentration limit ({max_per_token}) for {mint[:8]}.. reached")
+            if count >= max_for_token:
+                return RiskCheck(False, f"Concentration limit ({max_for_token}) for {mint[:8]}.. reached")
+
+        # 3b2. Slippage check — reject baskets where no profitable size exists
+        if self.slippage_monitor is not None:
+            max_size = self.slippage_monitor.get_basket_max_size(signal.mints)
+            if max_size <= 0:
+                return RiskCheck(False, "No profitable trade size for basket")
 
         # 3c. Rate limit — max entries per hour
         self._prune_entries()

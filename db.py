@@ -186,6 +186,25 @@ class Database:
             );
         """)
         self.conn.commit()
+        self._migrate()
+
+    def _migrate(self):
+        """Add columns to existing tables if missing."""
+        # entry SOL tracking on positions
+        for col, typ in [('entry_sol_before', 'REAL'),
+                         ('entry_sol_after', 'REAL')]:
+            try:
+                self.conn.execute(
+                    f"ALTER TABLE positions ADD COLUMN {col} {typ}")
+            except sqlite3.OperationalError:
+                pass  # already exists
+        # RL processing flag on exit_reconciliation
+        try:
+            self.conn.execute(
+                "ALTER TABLE exit_reconciliation ADD COLUMN rl_reward_assigned INTEGER DEFAULT 0")
+        except sqlite3.OperationalError:
+            pass
+        self.conn.commit()
 
     # --- Signal methods ---
 
@@ -513,6 +532,42 @@ class Database:
         )
         self.conn.commit()
         return cursor.lastrowid
+
+    def update_position_entry_sol(self, position_id: int,
+                                    sol_before: float, sol_after: float):
+        """Store actual SOL balance before/after entry execution."""
+        self.conn.execute(
+            "UPDATE positions SET entry_sol_before = ?, entry_sol_after = ? WHERE id = ?",
+            (sol_before, sol_after, position_id),
+        )
+        self.conn.commit()
+
+    def get_unprocessed_reconciliations(self) -> list:
+        """Return finalized exit reconciliations not yet fed to RL."""
+        rows = self.conn.execute("""
+            SELECT r.id, r.position_id, r.pair_key, r.sol_before, r.sol_after,
+                   r.expected_pnl, r.finalized_at,
+                   p.entry_sol_before, p.entry_sol_after,
+                   p.entry_time, p.exit_time
+            FROM exit_reconciliation r
+            JOIN positions p ON p.id = r.position_id
+            WHERE r.sol_after IS NOT NULL
+              AND r.rl_reward_assigned = 0
+        """).fetchall()
+        return [{'rec_id': r[0], 'position_id': r[1], 'pair_key': r[2],
+                 'exit_sol_before': r[3], 'exit_sol_after': r[4],
+                 'expected_pnl': r[5], 'finalized_at': r[6],
+                 'entry_sol_before': r[7], 'entry_sol_after': r[8],
+                 'entry_time': r[9], 'exit_time': r[10]}
+                for r in rows]
+
+    def mark_reconciliation_rl_processed(self, rec_id: int):
+        """Mark a reconciliation record as processed by RL."""
+        self.conn.execute(
+            "UPDATE exit_reconciliation SET rl_reward_assigned = 1 WHERE id = ?",
+            (rec_id,),
+        )
+        self.conn.commit()
 
     # --- RL experience persistence ---
 

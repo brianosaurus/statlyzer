@@ -179,6 +179,10 @@ class RLDecisionMaker:
         # Pending entry decisions (waiting for position close)
         self.pending_entries: Dict[str, Transition] = {}
 
+        # Pending reconciliation (live trades waiting for on-chain finalization)
+        # Keyed by position_id → (Transition, pair_key, duration_hours)
+        self.pending_reconciliations: Dict[int, tuple] = {}
+
         # Stats
         self.total_decisions = 0
         self.train_updates = 0
@@ -402,11 +406,23 @@ class RLDecisionMaker:
     # ── Reward feedback ──────────────────────────────────────────────
 
     def on_position_closed(self, pair_key: str, realized_pnl: float,
-                           entry_value: float, duration_hours: float):
-        """Called when a position closes. Assigns reward to the entry decision."""
+                           entry_value: float, duration_hours: float,
+                           is_live: bool = False, position_id: int = 0):
+        """Called when a position closes. Assigns reward to the entry decision.
+        For live trades, defers reward until exit reconciliation completes."""
         self.num_closed += 1
 
-        # Reward: $/hour for this trade
+        if is_live and position_id > 0:
+            # Defer reward — actual PnL comes from on-chain reconciliation
+            if pair_key in self.pending_entries:
+                t = self.pending_entries.pop(pair_key)
+                self.pending_reconciliations[position_id] = (t, pair_key, duration_hours)
+                logger.info(f"RL: deferred reward for position {position_id} "
+                            f"({pair_key[:16]}), waiting for reconciliation")
+            self._save_pending_to_db()
+            return
+
+        # Paper mode: use theoretical PnL immediately
         reward = realized_pnl / max(duration_hours, 0.01)
         self.recent_rewards.append(reward)
 
@@ -427,6 +443,65 @@ class RLDecisionMaker:
             obs=obs, action=ACTION_PASS, log_prob=log_prob, value=value,
             reward=0.0, done=True, context="entry",
         ))
+
+    def process_reconciled_exits(self, db, sol_price: float) -> int:
+        """Poll for finalized exit reconciliations and assign actual PnL rewards.
+        Returns number of reconciliations processed."""
+        if not self.pending_reconciliations and not db:
+            return 0
+
+        try:
+            records = db.get_unprocessed_reconciliations()
+        except Exception as e:
+            logger.debug(f"RL reconciliation poll failed: {e}")
+            return 0
+
+        processed = 0
+        for rec in records:
+            position_id = rec['position_id']
+            rec_id = rec['rec_id']
+
+            # Compute actual PnL from SOL balance deltas
+            entry_sol_before = rec.get('entry_sol_before')
+            entry_sol_after = rec.get('entry_sol_after')
+            exit_sol_before = rec['exit_sol_before']
+            exit_sol_after = rec['exit_sol_after']
+
+            if entry_sol_before is not None and entry_sol_after is not None:
+                # Full round-trip: entry delta + exit delta
+                entry_delta = entry_sol_after - entry_sol_before
+                exit_delta = exit_sol_after - exit_sol_before
+                actual_pnl_sol = entry_delta + exit_delta
+                actual_pnl_usd = actual_pnl_sol * sol_price
+            else:
+                # No entry SOL data — fall back to exit-only correction
+                # Adjust expected PnL by exit execution difference
+                actual_pnl_usd = rec['expected_pnl']
+
+            entry_time = rec.get('entry_time', 0)
+            exit_time = rec.get('exit_time', 0)
+            duration_hours = max((exit_time - entry_time) / 3600, 0.01) if exit_time and entry_time else 0.01
+
+            reward = actual_pnl_usd / max(duration_hours, 0.01)
+            self.recent_rewards.append(reward)
+
+            # Assign reward to the pending transition
+            if position_id in self.pending_reconciliations:
+                t, pair_key, _ = self.pending_reconciliations.pop(position_id)
+                t.reward = reward
+                t.done = True
+                self.buffer.append(t)
+                logger.info(f"RL: reconciled pos {position_id} — "
+                            f"actual=${actual_pnl_usd:+.4f} vs expected=${rec['expected_pnl']:+.4f} "
+                            f"reward={reward:+.4f}$/hr")
+            else:
+                logger.info(f"RL: reconciled pos {position_id} (no pending transition) — "
+                            f"actual=${actual_pnl_usd:+.4f}")
+
+            db.mark_reconciliation_rl_processed(rec_id)
+            processed += 1
+
+        return processed
 
     # ── Training ─────────────────────────────────────────────────────
 

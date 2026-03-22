@@ -143,6 +143,7 @@ class BasketState:
     cointegration_analyzed_at: int = 0
     in_position: bool = False
     position_entry_time: float = 0.0
+    position_entry_zscore: float = 0.0  # sign indicates direction
 
     # Resampling state: latest pending price per token
     pending_prices: List[float] = field(default=None, repr=False)
@@ -327,9 +328,9 @@ class SignalGenerator:
 
             basket_key = make_basket_key(mints)
             if basket_key in self.baskets:
-                self.baskets[basket_key].hedge_ratios = hedge_ratios
-                self.baskets[basket_key].half_life = hl_blocks
-                self.baskets[basket_key].cointegration_analyzed_at = int(r.analyzed_at)
+                # Don't overwrite scanner-loaded baskets — they have better
+                # hedge ratios from 16k+ observations vs inline's ~50
+                continue
             else:
                 state = BasketState(
                     pair_key=basket_key,
@@ -617,10 +618,17 @@ class SignalGenerator:
         elif z > self.config.entry_zscore:
             if not basket.in_position:
                 return SignalType.ENTRY_SHORT
-        elif abs(z) < self.config.exit_zscore:
-            if basket.in_position:
-                cooldown_secs = self.config.entry_cooldown_slots / 2.5
-                if (time.time() - basket.position_entry_time) >= cooldown_secs:
+        elif basket.in_position:
+            cooldown_secs = self.config.entry_cooldown_slots / 2.5
+            if (time.time() - basket.position_entry_time) >= cooldown_secs:
+                # Exit if z is within exit band
+                if abs(z) < self.config.exit_zscore:
+                    return SignalType.EXIT
+                # Exit if z crossed through the mean (overshot)
+                # Short entered at +z, exit if z went negative (and vice versa)
+                if basket.position_entry_zscore > 0 and z < 0:
+                    return SignalType.EXIT
+                if basket.position_entry_zscore < 0 and z > 0:
                     return SignalType.EXIT
         return None
 

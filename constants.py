@@ -189,7 +189,7 @@ USDC_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
 USDT_MINT = "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB"
 USDH_MINT = "USDH1SM1ojwWUga67PGrgFWUHibbjqMvuMaDkRJTgkX"
 ETH_MINT = "7vfCXTUXx5WJV5JADk17DUJ4ksgau7utNKj4b963voxs"
-BTC_MINT = "9n4nbM75f5Ui33ZbPYXn59EwSgE8CGsHtAeTH5YFeJ9E"
+BTC_MINT = "cbbtcf3aa214zXHbiAZQwf4122FBYbraNdFqgw4iMij"
 RAY_MINT = "4k3Dyjzvzp8eMZWUXbBCjEvwSkkk59S5iCNLY3QrkX6R"
 BONK_MINT = "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263"
 MSOL_MINT = "mSoLzYCxHdYgdzU16g5QSh3i5K3z3KZK7ytfqcJm7So"
@@ -207,7 +207,7 @@ ORCA_MINT = "orcaEKTdK7LKz57vaAYr9QeNsVEPfiu6QeMU1kektZE"
 WEN_MINT = "WENWENvqqNya429ubCdR81ZmD69brwQaaBYY6p3LCpk"
 RENDER_MINT = "rndrizKT3MK1iimdxRdWabcF7Zg7AR5T4nud4EkHBof"
 HNT_MINT = "hntyVP6YFm1Hg25TN9WGLqM12b8TQmcknKrdu1oxWux"
-TRUMP_MINT = "HaP8r3ksG76PhQLTqR8FYBeNiQpejcFbQmiHbg787Ut1"
+TRUMP_MINT = "WLFinEv6ypjkczcS83FZqFpgFZYwQXutRbxGe7oC16g"
 FARTCOIN_MINT = "9BB6NFEcjBCtnNLFko2FqVQBq8HHM13kCyYcdQbgpump"
 MEW_MINT = "MEW1gQWJ3nEXg2qgERiKu7FAFj79PHvQVREQUzScPP5"
 AI16Z_MINT = "HeLp6NuQkmYB4pYWo2zYs22mESHXPQYzXbB8n4V98jwC"
@@ -245,6 +245,34 @@ WELL_KNOWN_TOKENS = {
 
 # Stablecoin mints (for quote-token normalization)
 STABLECOIN_MINTS = {USDC_MINT, USDT_MINT, USDH_MINT}
+
+# Liquidity tiers for per-token concentration limits.
+# Multiplier applied to base max_per_token setting.
+# Tier 1 (3.0x): Deep liquidity, high market cap — SOL, BTC, ETH, stablecoins
+# Tier 2 (2.0x): Large cap, good liquidity — LSTs, major memecoins, DeFi blue chips
+# Tier 3 (1.0x): Mid cap — smaller memecoins, newer tokens (default)
+TOKEN_LIQUIDITY_TIER = {
+    # Tier 1: 3x concentration allowed
+    SOL_MINT: 3.0,
+    BTC_MINT: 3.0,
+    ETH_MINT: 3.0,
+    USDC_MINT: 3.0,
+    USDT_MINT: 3.0,
+    # Tier 2: 2x concentration allowed
+    MSOL_MINT: 2.0,
+    STSOL_MINT: 2.0,
+    JITOSOL_MINT: 2.0,
+    BSOL_MINT: 2.0,
+    JUPSOL_MINT: 2.0,
+    WIF_MINT: 2.0,
+    BONK_MINT: 2.0,
+    JUP_MINT: 2.0,
+    RAY_MINT: 2.0,
+    JTO_MINT: 2.0,
+    RENDER_MINT: 2.0,
+    TRUMP_MINT: 2.0,
+    # Tier 3 (1.0x): everything else — default, no entry needed
+}
 
 # Quote token priority for price normalization (most preferred first)
 QUOTE_PRIORITY = [USDC_MINT, USDT_MINT, USDH_MINT, SOL_MINT]

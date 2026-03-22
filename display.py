@@ -137,17 +137,30 @@ def print_progress(polls: int, num_prices: int, signals: int, trades: int, start
     sys.stdout.flush()
 
 
-def print_discovery_status(discovery):
-    """Print inline cointegration discovery status."""
+def print_discovery_status(discovery, baskets=None):
+    """Print inline cointegration discovery status and active basket breakdown."""
     tracked = len(discovery.token_histories)
     sufficient = sum(1 for h in discovery.token_histories.values() if h.buffer.count >= 100)
     discovered = len(discovery.discovered_pairs)
     elapsed = time.time() - discovery.start_time
     warmup_remaining = max(0, discovery.config.coint_warmup_minutes * 60 - elapsed)
 
-    status = f"  Discovery: {tracked} tokens tracked, {sufficient} with data, {discovered} pairs found"
+    if baskets:
+        total = len(baskets)
+        by_size = {}
+        for b in baskets.values():
+            by_size[b.basket_size] = by_size.get(b.basket_size, 0) + 1
+        parts = []
+        for sz in sorted(by_size):
+            label = "pairs" if sz == 2 else f"{sz}-token"
+            parts.append(f"{by_size[sz]} {label}")
+        breakdown = ", ".join(parts)
+        status = f"  Baskets: {total} active ({breakdown})"
+    else:
+        status = f"  Discovery: {tracked} tokens tracked, {sufficient} with data, {discovered} pairs found"
+
     if warmup_remaining > 0:
-        status += f" (warmup {warmup_remaining/60:.0f}min left)"
+        status += f" | warmup {warmup_remaining/60:.0f}min left"
     print(status)
 
 

@@ -268,7 +268,19 @@ async def run_monitor(config: Config, args):
     scanner_path = config.scanner_db_path if config.use_scanner_db else None
     signal_gen = SignalGenerator(config, scanner_path, db=db)
     portfolio = PortfolioManager(config, db)
-    risk_mgr = RiskManager(config, portfolio)
+
+    # Slippage monitor (optional — skip if token whitelist is set)
+    slippage_mon = None
+    if not config.token_whitelist_mints:
+        from slippage import SlippageMonitor
+        from constants import WELL_KNOWN_TOKENS, STABLECOIN_MINTS
+        slippage_mon = SlippageMonitor(
+            config, WELL_KNOWN_TOKENS, STABLECOIN_MINTS,
+            poll_interval=300,
+        )
+        slippage_mon.start()
+
+    risk_mgr = RiskManager(config, portfolio, slippage_monitor=slippage_mon)
     sizer = PositionSizer(config)
 
     # RL agent (optional)
@@ -306,6 +318,7 @@ async def run_monitor(config: Config, args):
         if basket_state:
             basket_state.in_position = True
             basket_state.position_entry_time = pos.entry_time
+            basket_state.position_entry_zscore = pos.entry_zscore
         else:
             # Create synthetic basket for orphaned position
             symbols = [token_symbol(m) for m in pos.mints]
@@ -322,6 +335,7 @@ async def run_monitor(config: Config, args):
             synthetic.init_buffers(config.lookback_window)
             synthetic.in_position = True
             synthetic.position_entry_time = pos.entry_time
+            synthetic.position_entry_zscore = pos.entry_zscore
             signal_gen.baskets[pair_key] = synthetic
             for m in pos.mints:
                 signal_gen.monitored_mints.add(m)
@@ -511,6 +525,16 @@ async def run_monitor(config: Config, args):
                     if size is None:
                         continue
 
+                    # Cap size by slippage-adjusted max for this basket
+                    if slippage_mon is not None:
+                        basket_max = slippage_mon.get_basket_max_size(sig.mints)
+                        if basket_max > 0 and size.total_exposure_usd > basket_max:
+                            scale = basket_max / size.total_exposure_usd
+                            size.amounts = [a * scale for a in size.amounts]
+                            size.amounts_raw = [max(1, int(r * scale)) for r in size.amounts_raw]
+                            size.dollar_amounts = [d * scale for d in size.dollar_amounts]
+                            size.total_exposure_usd = basket_max
+
                     # Apply RL size multiplier
                     if rl is not None and rl_size_mult != 1.0:
                         size.amounts = [a * rl_size_mult for a in size.amounts]
@@ -525,6 +549,9 @@ async def run_monitor(config: Config, args):
                             logger.info(f"Paper latency reject: {reject_reason}")
                             db.save_signal(sig, acted_on=False, reason=reject_reason)
                             continue
+
+                    # Capture SOL balance before entry (live only)
+                    entry_sol_before, _ = _get_sol_before(config, executor)
 
                     # Execute
                     try:
@@ -551,11 +578,20 @@ async def run_monitor(config: Config, args):
                     )
 
                     executor.log_execution(position.id, execution, 0)
+
+                    # Record entry SOL balance for reconciliation
+                    if entry_sol_before > 0 and hasattr(executor, 'get_sol_balance_and_slot_sync'):
+                        try:
+                            entry_sol_after, _ = executor.get_sol_balance_and_slot_sync()
+                            db.update_position_entry_sol(position.id, entry_sol_before, entry_sol_after)
+                        except Exception:
+                            pass
                     risk_mgr.record_entry()
                     stats['trades'] += 1
 
                     basket_state.in_position = True
                     basket_state.position_entry_time = time.time()
+                    basket_state.position_entry_zscore = sig.zscore
 
                     print_entry(sig, position, execution)
 
@@ -621,7 +657,9 @@ async def run_monitor(config: Config, args):
                             entry_val = sum(closed.entry_values) if closed.entry_values else 1.0
                             dur_hrs = max((closed.exit_time - closed.entry_time) / 3600, 0.01)
                             rl.on_position_closed(sig.pair_key, closed.realized_pnl,
-                                                  entry_val, dur_hrs)
+                                                  entry_val, dur_hrs,
+                                                  is_live=not config.paper_trade,
+                                                  position_id=closed.id)
                         basket_state = signal_gen.get_basket_states().get(sig.pair_key)
                         if basket_state:
                             basket_state.in_position = False
@@ -675,7 +713,9 @@ async def run_monitor(config: Config, args):
                         if rl is not None:
                             entry_val = sum(closed.entry_values) if closed.entry_values else 1.0
                             dur_hrs = max((closed.exit_time - closed.entry_time) / 3600, 0.01)
-                            rl.on_position_closed(pair_key, closed.realized_pnl, entry_val, dur_hrs)
+                            rl.on_position_closed(pair_key, closed.realized_pnl, entry_val, dur_hrs,
+                                                  is_live=not config.paper_trade,
+                                                  position_id=closed.id)
                         basket_state = signal_gen.get_basket_states().get(pair_key)
                         if basket_state:
                             basket_state.in_position = False
@@ -714,7 +754,9 @@ async def run_monitor(config: Config, args):
                         if rl is not None:
                             entry_val = sum(closed.entry_values) if closed.entry_values else 1.0
                             dur_hrs = max((closed.exit_time - closed.entry_time) / 3600, 0.01)
-                            rl.on_position_closed(pair_key, closed.realized_pnl, entry_val, dur_hrs)
+                            rl.on_position_closed(pair_key, closed.realized_pnl, entry_val, dur_hrs,
+                                                  is_live=not config.paper_trade,
+                                                  position_id=closed.id)
                         if basket_state:
                             basket_state.in_position = False
                         print_exit(closed, f"time_exit ({age:.0f}s > {max_age:.0f}s = {config.max_position_age_half_lives}x HL)")
@@ -750,7 +792,9 @@ async def run_monitor(config: Config, args):
                     if rl is not None:
                         entry_val = sum(closed.entry_values) if closed.entry_values else 1.0
                         dur_hrs = max((closed.exit_time - closed.entry_time) / 3600, 0.01)
-                        rl.on_position_closed(pair_key, closed.realized_pnl, entry_val, dur_hrs)
+                        rl.on_position_closed(pair_key, closed.realized_pnl, entry_val, dur_hrs,
+                                                  is_live=not config.paper_trade,
+                                                  position_id=closed.id)
                     print_exit(closed, "orphan_cleanup (basket no longer monitored)")
 
 
@@ -774,7 +818,9 @@ async def run_monitor(config: Config, args):
                 print_zscore_dashboard(signal_gen.get_basket_states())
                 print_positions(portfolio.positions, portfolio.get_total_value(),
                                 signal_gen.get_basket_states(), config.max_position_age_half_lives)
-                print_discovery_status(signal_gen.discovery)
+                print_discovery_status(signal_gen.discovery, signal_gen.get_basket_states())
+                if slippage_mon is not None:
+                    print(f"  {slippage_mon.status_str()}")
                 if rl is not None:
                     print(f"  RL: {rl.status_str()}")
                 last_dashboard = now_f
@@ -783,6 +829,14 @@ async def run_monitor(config: Config, args):
             if now_f - last_snapshot > snapshot_interval:
                 portfolio.take_snapshot()
                 last_snapshot = now_f
+
+            # RL: process finalized reconciliations (live trades)
+            if rl is not None and not config.paper_trade:
+                sol_price = signal_gen.sol_usd_price or 0
+                if sol_price > 0:
+                    n = rl.process_reconciled_exits(db, sol_price)
+                    if n > 0:
+                        logger.info(f"RL: processed {n} reconciled exit(s)")
 
             # RL periodic training
             if rl is not None and now_f - last_rl_train > rl_train_interval:
@@ -804,6 +858,8 @@ async def run_monitor(config: Config, args):
     except KeyboardInterrupt:
         pass
     finally:
+        if slippage_mon is not None:
+            slippage_mon.stop()
         portfolio.take_snapshot()
         elapsed = time.time() - start_time
         print_summary(portfolio, db, elapsed)

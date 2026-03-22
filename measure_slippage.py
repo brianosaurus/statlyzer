@@ -20,21 +20,12 @@ SOL_MINT = "So11111111111111111111111111111111111111112"
 JUPITER_API_KEY = os.getenv("JUPITER_API_KEY", "")
 JUPITER_URL = os.getenv("JUPITER_QUOTE_URL", "https://api.jup.ag").rstrip("/")
 
-# Tokens we trade in 2-token pairs (from scanner results)
+# All non-stablecoin tokens from WELL_KNOWN_TOKENS
+from constants import WELL_KNOWN_TOKENS, STABLECOIN_MINTS
 TOKENS = {
-    "7dHbWXmci3dT8UFYWYZweBLXgycu7Y3iL6trKn1Y7ARj": ("stSOL", 9),
-    "J1toso1uCk3RLmjorhTtrVwY9HJ7X8V9yYac6Y7kGCPn": ("jitoSOL", 9),
-    "mSoLzYCxHdYgdzU16g5QSh3i5K3z3KZK7ytfqcJm7So": ("mSOL", 9),
-    "bSo13r4TkiE4KumL71LsHTPpL2euBYLFx6h9HP3piy1": ("bSOL", 9),
-    "jupSoLaHXQiZZTSfEWMTRRgpnyFm8f6sZdosWBjx93v": ("jupSOL", 9),
-    "EKpQGSJtjMFqKZ9KQanSqYXRcF8fBopzLHYxdM65zcjm": ("WIF", 6),
-    "7GCihgDB8fe6LNa32gd7QZIk2sg3R4bfETkfso6nxXvf": ("FARTCOIN", 6),  # corrected decimals if needed
-    "MEW1gQWJ3nEXg2qgERiKu7FAFj79PHvQVREQUzScPP5": ("MEW", 5),
-    "rndrizKT3MK1iimdxRdWabcF7Zg7AR5T4nud4EkHBof": ("RENDER", 8),
-    "7vfCXTUXx5WJV5JADk17DUJ4ksgau7utNKj4b963voxs": ("RAY", 6),
-    "HZ1JovNiVvGrGNiiYvEozEVgZ58xaU3RKwX8eACQBCt3": ("PYTH", 6),
-    "jtojtomepa8beP8AuQc6eXt5FriJwfFMwQx2v2f9mCL": ("JTO", 9),
-    "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263": ("BONK", 5),
+    mint: (info["symbol"], info["decimals"])
+    for mint, info in WELL_KNOWN_TOKENS.items()
+    if mint not in STABLECOIN_MINTS and mint != SOL_MINT
 }
 
 # Trade sizes in USD to test
