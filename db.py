@@ -286,6 +286,50 @@ class Database:
         )
         self.conn.commit()
 
+    # --- Per-token edge estimation ---
+
+    def get_per_token_edge_bps(self, min_trades: int = 5) -> Dict[str, float]:
+        """Compute per-token edge in bps from closed positions.
+
+        For each token, finds all closed positions containing that token,
+        computes average (realized_pnl / entry_value) in bps.
+        Only returns tokens with at least min_trades closed positions.
+        """
+        rows = self.conn.execute("""
+            SELECT mints_json, entry_values_json, realized_pnl
+            FROM positions
+            WHERE status IN ('closed', 'stopped_out')
+              AND realized_pnl IS NOT NULL
+        """).fetchall()
+
+        # Accumulate per-token: total edge bps weighted by entry value
+        from collections import defaultdict
+        token_pnl = defaultdict(float)     # mint -> sum of pnl attributed
+        token_value = defaultdict(float)   # mint -> sum of entry value
+        token_count = defaultdict(int)     # mint -> num positions
+
+        for mints_json, values_json, pnl in rows:
+            mints = json.loads(mints_json)
+            values = json.loads(values_json)
+            total_value = sum(values)
+            if total_value <= 0:
+                continue
+            # Attribute PnL proportionally to each token's entry value
+            for mint, val in zip(mints, values):
+                if val <= 0:
+                    continue
+                share = val / total_value
+                token_pnl[mint] += pnl * share
+                token_value[mint] += val
+                token_count[mint] += 1
+
+        result = {}
+        for mint in token_pnl:
+            if token_count[mint] >= min_trades and token_value[mint] > 0:
+                edge_bps = (token_pnl[mint] / token_value[mint]) * 10000
+                result[mint] = edge_bps
+        return result
+
     # --- Portfolio snapshots ---
 
     def save_snapshot(self, total_value: float, num_positions: int,

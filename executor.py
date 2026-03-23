@@ -59,10 +59,11 @@ class PaperExecutor:
 
     BASE_TX_FEE_LAMPORTS = 5000  # Solana base fee per signature
 
-    def __init__(self, config, db):
+    def __init__(self, config, db, slippage_monitor=None):
         self.config = config
         self.db = db
         self.sol_usd_price: float = 0.0  # set by statalyzer main loop
+        self.slippage_monitor = slippage_monitor
 
     async def execute_entry(self, signal, position_size, prices: List[float]) -> Optional[BasketExecution]:
         """Simulate entry fills for all legs with realistic failure/slippage."""
@@ -81,7 +82,8 @@ class PaperExecutor:
             signed_hr = hr[i] if signal.signal_type == SignalType.ENTRY_LONG else -hr[i]
             side = "buy" if signed_hr > 0 else "sell"
 
-            slip = self._adverse_slippage()
+            leg_usd = position_size.dollar_amounts[i] if i < len(position_size.dollar_amounts) else 0
+            slip = self._adverse_slippage(mint=signal.mints[i], size_usd=leg_usd)
             fill_price = (prices[i] * (1 + slip / 10000) if side == "buy"
                           else prices[i] * (1 - slip / 10000))
 
@@ -116,16 +118,19 @@ class PaperExecutor:
             signed_hr = hr[i] if position.direction == "long" else -hr[i]
             side = "sell" if signed_hr > 0 else "buy"
 
-            # Simulate slippage escalation: 1x → 2x → 4x (like live retries)
+            # Simulate slippage escalation on retries.
+            # With dynamic per-token slippage, base already reflects real market —
+            # escalation models widening tolerance on retry, not multiplying real slippage.
             escalation = 1.0
             if random.random() < 0.15:  # 15% chance need retry
-                escalation = 2.0
+                escalation = 1.5
                 total_retries += 1
-                if random.random() < 0.10:  # 10% of retries need 4x
-                    escalation = 4.0
+                if random.random() < 0.10:  # 10% of retries need further escalation
+                    escalation = 2.0
                     total_retries += 1
 
-            slip = self._adverse_slippage() * escalation
+            leg_usd = abs(prices[i] * position.quantities[i])
+            slip = self._adverse_slippage(mint=position.mints[i], size_usd=leg_usd) * escalation
             fill_price = (prices[i] * (1 + slip / 10000) if side == "buy"
                           else prices[i] * (1 - slip / 10000))
 
@@ -195,15 +200,26 @@ class PaperExecutor:
                 is_paper=True,
             )
 
-    def _adverse_slippage(self) -> float:
+    def _adverse_slippage(self, mint: str = None, size_usd: float = 0) -> float:
         """Always-adverse slippage in bps using lognormal distribution.
 
-        Mean slippage ≈ slippage_bps/2, always positive (= always adverse).
+        Uses measured per-token slippage from SlippageMonitor when available,
+        falling back to config.slippage_bps.
         Tail risk: occasional large slippage events.
         """
-        # lognormal with mu/sigma tuned so median ≈ slippage_bps/2
         import math
-        median_bps = self.config.slippage_bps / 2
+
+        # Use measured per-leg slippage if available (round-trip / 2 = per-leg)
+        if mint and self.slippage_monitor:
+            measured_rt = self.slippage_monitor.get_slippage_at_size(mint, size_usd or 500)
+            if measured_rt is not None:
+                base_bps = measured_rt / 2  # per-leg = half of round-trip
+            else:
+                base_bps = 10  # conservative fallback for unmeasured tokens
+        else:
+            base_bps = self.config.slippage_bps
+
+        median_bps = base_bps / 2
         if median_bps <= 0:
             return 0.0
         mu = math.log(median_bps)

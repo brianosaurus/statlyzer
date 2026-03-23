@@ -20,10 +20,11 @@ class RiskCheck:
 class RiskManager:
     """Evaluates risk before allowing new positions."""
 
-    def __init__(self, config, portfolio, slippage_monitor=None):
+    def __init__(self, config, portfolio, slippage_monitor=None, rl_enabled=False):
         self.config = config
         self.portfolio = portfolio
         self.slippage_monitor = slippage_monitor
+        self.rl_enabled = rl_enabled
         self.entries_this_hour: list = []  # timestamps
         self.kill_switch: bool = False
         self.kill_switch_time: float = 0  # when kill switch was engaged
@@ -31,24 +32,20 @@ class RiskManager:
 
     def check_entry(self, signal, pair_state) -> RiskCheck:
         """Run all risk checks before allowing a new entry."""
-        # 1. Kill switch (auto-resets after cooldown if drawdown recovered)
-        if self.kill_switch:
-            elapsed = time.time() - self.kill_switch_time
-            if elapsed > self.kill_switch_cooldown:
-                dd = self.portfolio.get_drawdown()
-                if dd <= self.config.max_drawdown_pct:
-                    logger.info(f"Kill switch auto-reset after {elapsed:.0f}s cooldown "
-                                f"(drawdown recovered to {dd:.1%})")
-                    self.kill_switch = False
-                else:
-                    return RiskCheck(False, f"Kill switch engaged (dd={dd:.1%}, cooldown {elapsed:.0f}s)")
-            else:
-                return RiskCheck(False, "Kill switch engaged")
+        # 1. Kill switch — disabled
+        # if self.kill_switch:
+        #     pass
 
-        # 1b. Entry z-score cap — don't enter too close to stop loss
+        # 1b. Entry z-score cap
+        # When RL is enabled, widen to stop_loss * 0.9 (RL decides via PASS)
+        # Without RL, use the configured max_entry_zscore
         abs_z = abs(signal.zscore)
-        if abs_z > self.config.max_entry_zscore:
-            return RiskCheck(False, f"|z|={abs_z:.1f} > max entry {self.config.max_entry_zscore}")
+        if self.rl_enabled:
+            hard_cap = self.config.stop_loss_zscore * 0.9
+        else:
+            hard_cap = self.config.max_entry_zscore
+        if abs_z > hard_cap:
+            return RiskCheck(False, f"|z|={abs_z:.1f} > max entry {hard_cap:.1f}")
 
         # 2. Already in this pair
         if self.portfolio.has_position(signal.pair_key):
@@ -75,16 +72,19 @@ class RiskManager:
             if count >= max_for_token:
                 return RiskCheck(False, f"Concentration limit ({max_for_token}) for {mint[:8]}.. reached")
 
-        # 3b2. Slippage check — reject baskets where no profitable size exists
+        # 3b2. Slippage check — block entries until first measurement, then reject unmeasured tokens
         if self.slippage_monitor is not None:
-            max_size = self.slippage_monitor.get_basket_max_size(signal.mints)
-            if max_size <= 0:
-                return RiskCheck(False, "No profitable trade size for basket")
+            if not self.slippage_monitor.is_ready():
+                return RiskCheck(False, "Slippage monitor warming up")
+            if not self.slippage_monitor.is_basket_tradeable(signal.mints):
+                return RiskCheck(False, "Unmeasured token in basket")
 
         # 3c. Rate limit — max entries per hour
+        # When RL is enabled, allow 3x the configured rate (RL controls pacing via PASS)
         self._prune_entries()
-        if len(self.entries_this_hour) >= self.config.max_positions_per_hour:
-            return RiskCheck(False, f"Rate limit ({self.config.max_positions_per_hour}/hr) reached")
+        rate_cap = self.config.max_positions_per_hour * (3 if self.rl_enabled else 1)
+        if len(self.entries_this_hour) >= rate_cap:
+            return RiskCheck(False, f"Rate limit ({rate_cap}/hr) reached")
 
         # 4. Max exposure (scales with portfolio capital)
         exposure = self.portfolio.get_total_exposure()
@@ -92,9 +92,9 @@ class RiskManager:
         if exposure >= max_exposure:
             return RiskCheck(False, f"Max exposure (${max_exposure:.0f}) reached")
 
-        # 5. Drawdown check
-        if self.check_drawdown():
-            return RiskCheck(False, f"Max drawdown ({self.config.max_drawdown_pct:.0%}) exceeded — kill switch engaged")
+        # 5. Drawdown check — disabled
+        # if self.check_drawdown():
+        #     pass
 
         # 6. Pair staleness
         analyzed_at = pair_state.cointegration_analyzed_at

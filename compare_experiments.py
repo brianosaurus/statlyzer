@@ -22,8 +22,6 @@ from typing import Dict, List, Optional, Tuple
 
 
 EXPERIMENTS = {
-    "P": {"db": "exp_p.db", "label": "LIVE",
-           "desc": "40pos/10tok/5x/z2.0-4.0/ez0.2/30s/LST/LIVE"},
     # Phase 4: LST-only (pure LST baskets, realistic 1bps)
     "LL": {"db": "exp_ll.db", "label": "LST $10k",
             "desc": "40pos/10tok/5x/7%/z2.0-4.0/ez0.2/1bps/30s/LST/LL/$10k"},

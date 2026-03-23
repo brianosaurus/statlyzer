@@ -23,10 +23,10 @@ import torch.nn.functional as F
 
 logger = logging.getLogger(__name__)
 
-# Observation dimensions
-OBS_DIM = 21
+# Observation dimensions (21 base + 3 slippage = 24)
+OBS_DIM = 24
 
-# Actions
+# Actions: pass + 3 sizes + exit = 5
 ACTION_PASS = 0
 ACTION_ENTER_SMALL = 1   # 0.5x base size
 ACTION_ENTER_NORMAL = 2  # 1.0x base size
@@ -218,8 +218,8 @@ class RLDecisionMaker:
     # ── Observation builder ──────────────────────────────────────────
 
     def build_obs(self, signal, basket_state, portfolio, risk_mgr,
-                  position=None) -> np.ndarray:
-        """Build the 21-dim observation vector."""
+                  position=None, slippage_monitor=None) -> np.ndarray:
+        """Build the 24-dim observation vector."""
         z = signal.zscore if signal else (basket_state.current_zscore if basket_state else 0.0)
         spread_std = basket_state.spread_std if basket_state else 0.0
         half_life = basket_state.half_life if basket_state else 500.0
@@ -281,6 +281,25 @@ class RLDecisionMaker:
         hour = (time.time() % 86400) / 3600
         tod_sin = math.sin(2 * math.pi * hour / 24)
 
+        # Slippage features
+        worst_rt_bps = 0.0
+        avg_rt_bps = 0.0
+        basket_n = signal.basket_size if signal else (basket_state.basket_size if basket_state else 2)
+        if slippage_monitor is not None:
+            mints = signal.mints if signal else (basket_state.mints if basket_state else [])
+            from constants import STABLECOIN_MINTS
+            sol_mint = "So11111111111111111111111111111111111111112"
+            rts = []
+            for m in mints:
+                if m in STABLECOIN_MINTS or m == sol_mint:
+                    continue
+                rt = slippage_monitor.get_slippage_at_size(m, 500)
+                if rt is not None:
+                    rts.append(rt)
+            if rts:
+                worst_rt_bps = max(rts) / 100  # normalize: 100bps → 1.0
+                avg_rt_bps = sum(rts) / len(rts) / 100
+
         obs = np.array([
             # Signal (7)
             z,
@@ -307,6 +326,10 @@ class RLDecisionMaker:
             avg_pnl_norm,
             sharpe,
             tod_sin,
+            # Slippage (3)
+            worst_rt_bps,
+            avg_rt_bps,
+            basket_n / 4.0,  # normalized basket size (2→0.5, 4→1.0)
         ], dtype=np.float32)
 
         # Clamp extreme values
@@ -315,12 +338,15 @@ class RLDecisionMaker:
 
     # ── Decision methods ─────────────────────────────────────────────
 
-    def decide_entry(self, signal, basket_state, portfolio, risk_mgr) -> int:
+    def decide_entry(self, signal, basket_state, portfolio, risk_mgr,
+                     slippage_monitor=None) -> int:
         """
         Decide entry action for a signal that passed risk checks.
-        Returns action index (0=PASS, 1=SMALL, 2=NORMAL, 3=LARGE).
+        Returns action index. Use SIZE_MULTIPLIERS[action] and
+        SLIPPAGE_BUDGET_BPS[action] to get the parameters.
         """
-        obs = self.build_obs(signal, basket_state, portfolio, risk_mgr)
+        obs = self.build_obs(signal, basket_state, portfolio, risk_mgr,
+                             slippage_monitor=slippage_monitor)
         phase = self._phase()
 
         # Phase 1: always enter normal (rule-based passthrough)
@@ -350,14 +376,14 @@ class RLDecisionMaker:
         return action
 
     def decide_exit(self, signal, basket_state, portfolio, risk_mgr,
-                    position) -> bool:
+                    position, slippage_monitor=None) -> bool:
         """
         Decide whether to exit when an EXIT signal fires.
         Returns True to exit, False to hold.
         Stop-loss signals bypass this (always exit).
         """
         obs = self.build_obs(signal, basket_state, portfolio, risk_mgr,
-                             position=position)
+                             position=position, slippage_monitor=slippage_monitor)
         phase = self._phase()
 
         # Phase 1: always exit (rule-based passthrough)
@@ -435,9 +461,11 @@ class RLDecisionMaker:
         # Persist pending entry to DB for crash recovery
         self._save_pending_to_db()
 
-    def on_entry_skipped(self, signal, basket_state, portfolio, risk_mgr):
+    def on_entry_skipped(self, signal, basket_state, portfolio, risk_mgr,
+                         slippage_monitor=None):
         """Record a PASS decision with zero reward."""
-        obs = self.build_obs(signal, basket_state, portfolio, risk_mgr)
+        obs = self.build_obs(signal, basket_state, portfolio, risk_mgr,
+                             slippage_monitor=slippage_monitor)
         log_prob, value = self._get_log_prob_value(obs, ACTION_PASS, ENTRY_ACTIONS)
         self.buffer.append(Transition(
             obs=obs, action=ACTION_PASS, log_prob=log_prob, value=value,
@@ -508,6 +536,9 @@ class RLDecisionMaker:
     def maybe_train(self) -> bool:
         """Run PPO update if buffer has enough transitions. Returns True if trained."""
         done_transitions = [t for t in self.buffer if t.done]
+        # Drop transitions with stale observation dimensions or invalid actions
+        done_transitions = [t for t in done_transitions
+                            if len(t.obs) == OBS_DIM and t.action < NUM_ACTIONS]
         if len(done_transitions) < self.MIN_BUFFER_SIZE:
             return False
 
@@ -522,11 +553,9 @@ class RLDecisionMaker:
         # Save model
         self.save()
 
-        # Check for fallback
-        if self._should_fallback():
-            logger.warning("RL fallback triggered: performance below baseline. "
-                           "Reverting to Phase 1.")
-            self.num_closed = 0  # Reset to phase 1
+        # RL fallback — disabled
+        # if self._should_fallback():
+        #     pass
 
         return True
 
@@ -546,6 +575,12 @@ class RLDecisionMaker:
 
     def _ppo_update(self, transitions: List[Transition]):
         """Run PPO update on completed transitions."""
+        # Filter out transitions with stale obs dimensions or invalid actions
+        transitions = [t for t in transitions
+                       if len(t.obs) == OBS_DIM and t.action < NUM_ACTIONS]
+        if len(transitions) < self.MIN_BUFFER_SIZE:
+            logger.info("RL training skipped: not enough transitions with current obs dim")
+            return
         obs_arr = np.array([t.obs for t in transitions])
         actions = torch.LongTensor([t.action for t in transitions])
         old_log_probs = torch.FloatTensor([t.log_prob for t in transitions])

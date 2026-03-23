@@ -614,9 +614,18 @@ class SignalGenerator:
 
         if z < -self.config.entry_zscore:
             if not basket.in_position:
+                # Check minimum spread deviation in bps
+                if self.config.min_spread_bps > 0:
+                    spread_dev_bps = abs(z) * basket.spread_std * 10000
+                    if spread_dev_bps < self.config.min_spread_bps:
+                        return None
                 return SignalType.ENTRY_LONG
         elif z > self.config.entry_zscore:
             if not basket.in_position:
+                if self.config.min_spread_bps > 0:
+                    spread_dev_bps = abs(z) * basket.spread_std * 10000
+                    if spread_dev_bps < self.config.min_spread_bps:
+                        return None
                 return SignalType.ENTRY_SHORT
         elif basket.in_position:
             cooldown_secs = self.config.entry_cooldown_slots / 2.5

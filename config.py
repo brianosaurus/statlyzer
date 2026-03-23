@@ -33,6 +33,7 @@ class Config:
     exit_zscore: float = float(os.getenv('EXIT_ZSCORE', '0.5'))
     stop_loss_zscore: float = float(os.getenv('STOP_LOSS_ZSCORE', '4.0'))
     max_entry_zscore: float = float(os.getenv('MAX_ENTRY_ZSCORE', '3.0'))
+    min_spread_bps: float = float(os.getenv('MIN_SPREAD_BPS', '0'))  # min abs spread deviation in bps to enter
     allowed_direction: str = os.getenv('ALLOWED_DIRECTION', 'both')  # both, long, short
 
     # Position sizing

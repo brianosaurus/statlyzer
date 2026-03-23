@@ -48,13 +48,15 @@ class SlippageMonitor:
                  stablecoin_mints: Set[str],
                  poll_interval: float = 600,
                  edge_bps: float = DEFAULT_EDGE_BPS,
-                 fixed_fees_usd: float = DEFAULT_FIXED_FEES_USD):
+                 fixed_fees_usd: float = DEFAULT_FIXED_FEES_USD,
+                 db=None):
         self.config = config
         self.tokens = tokens
         self.stablecoin_mints = stablecoin_mints
         self.poll_interval = poll_interval
-        self.edge_bps = edge_bps
+        self.default_edge_bps = edge_bps
         self.fixed_fees_usd = fixed_fees_usd
+        self.db = db
 
         self.jupiter_api_key = os.environ.get("JUPITER_API_KEY", "")
         self.jupiter_url = os.environ.get(
@@ -63,11 +65,13 @@ class SlippageMonitor:
 
         self._lock = threading.Lock()
         self._token_slippage: Dict[str, TokenSlippage] = {}
+        self._token_edge: Dict[str, float] = {}  # mint -> edge_bps from history
         self._sol_price: float = 0.0
         self._last_poll: float = 0.0
 
         self._thread: Optional[threading.Thread] = None
         self._stop = threading.Event()
+        self._ready = threading.Event()  # set after first measurement completes
 
     def start(self):
         if self._thread and self._thread.is_alive():
@@ -97,8 +101,37 @@ class SlippageMonitor:
             if not self._stop.is_set():
                 self._measure_all()
 
+    def _refresh_edge_estimates(self):
+        """Refresh per-token edge estimates from closed position history."""
+        if self.db is None:
+            return
+        try:
+            edges = self.db.get_per_token_edge_bps(min_trades=5)
+            with self._lock:
+                self._token_edge = edges
+            if edges:
+                symbols = []
+                for mint, edge in sorted(edges.items(), key=lambda x: -x[1]):
+                    info = self.tokens.get(mint, {})
+                    sym = info.get("symbol", mint[:8])
+                    symbols.append("%s=%.1f" % (sym, edge))
+                logger.info("Per-token edge (bps): %s | default=%.1f" % (
+                    ", ".join(symbols), self.default_edge_bps))
+        except Exception as e:
+            logger.warning("Failed to refresh edge estimates: %s" % e)
+
+    def _get_edge_for_token(self, mint: str) -> float:
+        """Return edge in bps for a token — historical if available, else default."""
+        with self._lock:
+            edge = self._token_edge.get(mint)
+        if edge is not None and edge > 0:
+            return edge
+        return self.default_edge_bps
+
     def _measure_all(self):
         try:
+            self._refresh_edge_estimates()
+
             mints = [m for m in self.tokens if m not in self.stablecoin_mints and m != SOL_MINT]
             prices = self._get_prices(mints + [SOL_MINT])
             sol_price = prices.get(SOL_MINT, 87.0)
@@ -144,7 +177,8 @@ class SlippageMonitor:
                     else:
                         curve = new_curve
 
-                    max_size = self._compute_max_profitable_size(curve)
+                    token_edge = self._get_edge_for_token(mint)
+                    max_size = self._compute_max_profitable_size(curve, token_edge)
                     ts = TokenSlippage(
                         mint=mint, symbol=symbol, curve=curve,
                         measured_at=time.time(),
@@ -159,30 +193,44 @@ class SlippageMonitor:
                 self._sol_price = sol_price
                 self._last_poll = time.time()
 
-            # Log summary
+            # Log summary — show round-trip slippage at $1k per token
             with self._lock:
                 all_ts = self._token_slippage
-            tradeable = [(ts.symbol, ts.max_profitable_size)
-                         for ts in all_ts.values() if ts.max_profitable_size > 0]
-            tradeable.sort(key=lambda x: -x[1])
+            measured = []
+            for ts in all_ts.values():
+                rt_1k = 0
+                for size, rt in ts.curve:
+                    if size >= 1000:
+                        rt_1k = rt
+                        break
+                    rt_1k = rt
+                measured.append((ts.symbol, rt_1k))
+            measured.sort(key=lambda x: x[1])
             logger.info(
-                "Slippage scan: %d/%d tokens tradeable | %s" % (
-                    len(tradeable), len(all_ts),
-                    ", ".join("%s($%.0f)" % (s, sz) for s, sz in tradeable)
+                "Slippage scan: %d tokens measured | %s" % (
+                    len(measured),
+                    ", ".join("%s(%.0fbps)" % (s, rt) for s, rt in measured)
                 )
             )
+
+            if not self._ready.is_set():
+                self._ready.set()
+                logger.info("Slippage monitor ready — entries unblocked")
 
         except Exception as e:
             logger.warning("Slippage measurement failed: %s" % e)
 
-    def _compute_max_profitable_size(self, curve: List[Tuple[float, float]]) -> float:
+    def _compute_max_profitable_size(self, curve: List[Tuple[float, float]],
+                                      edge_bps: float = None) -> float:
         """Find the largest trade size where the trade is still profitable.
 
         profit = size × (edge_bps - slippage_bps) / 10000 - fixed_fees > 0
         """
+        if edge_bps is None:
+            edge_bps = self.default_edge_bps
         max_size = 0.0
         for size_usd, rt_bps in curve:
-            net_edge_bps = self.edge_bps - rt_bps
+            net_edge_bps = edge_bps - rt_bps
             if net_edge_bps <= 0:
                 continue
             profit = size_usd * net_edge_bps / 10000 - self.fixed_fees_usd
@@ -200,7 +248,7 @@ class SlippageMonitor:
                 # profit(s) = s * (edge - lerp(rt1,rt2,t)) / 10000 - fees = 0
                 # Approximate: use rt at the midpoint
                 mid_rt = (rt1 + rt2) / 2
-                net = self.edge_bps - mid_rt
+                net = edge_bps - mid_rt
                 if net > 0:
                     breakeven = self.fixed_fees_usd / (net / 10000)
                     if s1 < breakeven < s2:
@@ -278,9 +326,15 @@ class SlippageMonitor:
 
     # ── Public API ──────────────────────────────────────────────
 
+    def is_ready(self) -> bool:
+        """True after the first slippage measurement completes."""
+        return self._ready.is_set()
+
     def get_basket_max_size(self, mints: List[str]) -> float:
         """Return the max profitable trade size for a basket.
-        Limited by the worst (smallest max_size) token in the basket."""
+        Limited by the worst (smallest max_size) token in the basket.
+        Returns largest probe size for tokens with no profitability cap
+        (slippage data available but no edge-based limit)."""
         with self._lock:
             if not self._token_slippage:
                 return 0.0
@@ -291,9 +345,11 @@ class SlippageMonitor:
                 ts = self._token_slippage.get(mint)
                 if ts is None:
                     return 0.0  # unknown token = can't trade
-                if ts.max_profitable_size <= 0:
-                    return 0.0  # token is never profitable
-                max_sizes.append(ts.max_profitable_size)
+                if ts.max_profitable_size > 0:
+                    max_sizes.append(ts.max_profitable_size)
+                else:
+                    # No edge-based cap — use largest probe size
+                    max_sizes.append(PROBE_SIZES[-1])
             return min(max_sizes) if max_sizes else 0.0
 
     def get_slippage_at_size(self, mint: str, size_usd: float) -> Optional[float]:
@@ -313,30 +369,40 @@ class SlippageMonitor:
             return ts.curve[-1][1]  # extrapolate last
 
     def is_basket_tradeable(self, mints: List[str]) -> bool:
-        """Check if a basket can be traded at any profitable size."""
-        return self.get_basket_max_size(mints) > 0
+        """Check if a basket has slippage data (all measured tokens are tradeable)."""
+        with self._lock:
+            if not self._token_slippage:
+                return False
+            for mint in mints:
+                if mint in self.stablecoin_mints or mint == SOL_MINT:
+                    continue
+                if mint not in self._token_slippage:
+                    return False
+            return True
 
     def get_tradeable_mints(self) -> Set[str]:
         with self._lock:
-            return {mint for mint, ts in self._token_slippage.items()
-                    if ts.max_profitable_size > 0}
+            return set(self._token_slippage.keys())
 
     def status_str(self) -> str:
         with self._lock:
             if not self._token_slippage:
                 return "Slippage: measuring..."
 
-            tradeable = sorted(
-                [(ts.symbol, ts.max_profitable_size)
-                 for ts in self._token_slippage.values()
-                 if ts.max_profitable_size > 0],
-                key=lambda x: -x[1],
-            )
             n_total = len(self._token_slippage)
+            # Show tokens with round-trip slippage at $1k size
+            tokens = []
+            for ts in self._token_slippage.values():
+                # Find RT bps at $1000 probe (or closest)
+                rt_bps = 0
+                for size, rt in ts.curve:
+                    if size >= 1000:
+                        rt_bps = rt
+                        break
+                    rt_bps = rt  # use last if all < 1000
+                tokens.append((ts.symbol, rt_bps))
+            tokens.sort(key=lambda x: x[1])
             tokens_str = ", ".join(
-                "%s($%s)" % (s, ("%.0f" % sz) if sz < 10000 else "10k+")
-                for s, sz in tradeable
+                "%s(%.0fbps)" % (s, rt) for s, rt in tokens
             )
-            return "Slippage: %d/%d tradeable [%s]" % (
-                len(tradeable), n_total, tokens_str
-            )
+            return "Slippage: %d measured [%s]" % (n_total, tokens_str)

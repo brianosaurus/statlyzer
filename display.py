@@ -6,6 +6,16 @@ import sys
 import time
 from typing import Dict, List
 
+from constants import WELL_KNOWN_TOKENS
+
+# mint -> symbol lookup
+_MINT_TO_SYMBOL = {mint: info["symbol"] for mint, info in WELL_KNOWN_TOKENS.items()}
+
+
+def mints_to_label(mints: List[str]) -> str:
+    """Convert list of mints to human-readable label like 'mSOL/jitoSOL'."""
+    return "/".join(_MINT_TO_SYMBOL.get(m, m[:6]) for m in mints)
+
 
 def basket_label(symbols: List[str]) -> str:
     return "/".join(symbols)
@@ -86,7 +96,7 @@ def print_positions(positions: Dict, portfolio_value: float,
 
         now = int(time.time())
         for pair_key, pos in positions.items():
-            pair_short = pair_key[:8] + '..' + pair_key[-6:]
+            pair_short = mints_to_label(pos.mints)
             exposure = sum(abs(pos.current_prices[i] * pos.quantities[i])
                           for i in range(pos.basket_size))
             # Compute time remaining until timeout
@@ -117,12 +127,13 @@ def print_zscore_dashboard(basket_states: Dict, max_rows: int = 10):
     if not active:
         return
 
-    print(f"\n  {'Basket':<28} {'Z-score':>8} {'Spread':>10} {'Obs':>5}")
-    print(f"  {'-'*28} {'-'*8} {'-'*10} {'-'*5}")
+    print(f"\n  {'Basket':<28} {'Z-score':>8} {'Edge bps':>9} {'Spread':>10} {'Obs':>5}")
+    print(f"  {'-'*28} {'-'*8} {'-'*9} {'-'*10} {'-'*5}")
 
     for pair_key, bsk in active[:max_rows]:
         label = basket_label(bsk.symbols)
-        print(f"  {label:<28} {bsk.current_zscore:>+8.3f} {bsk.current_spread:>10.6f} {bsk.price_buffers[0].count:>5}")
+        edge_bps = abs(bsk.current_zscore) * bsk.spread_std * 10000 if bsk.spread_std > 0 else 0
+        print(f"  {label:<28} {bsk.current_zscore:>+8.3f} {edge_bps:>8.1f} {bsk.current_spread:>10.6f} {bsk.price_buffers[0].count:>5}")
 
     if len(active) > max_rows:
         print(f"  ... and {len(active) - max_rows} more baskets")

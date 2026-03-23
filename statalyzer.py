@@ -79,6 +79,8 @@ def parse_args():
                         help='Sizing method: fixed_fraction or kelly')
     parser.add_argument('--max-entry-z', type=float, default=None,
                         help='Max entry z-score (reject entries above this)')
+    parser.add_argument('--min-spread-bps', type=float, default=None,
+                        help='Min absolute spread deviation in bps to enter (e.g. 10)')
     parser.add_argument('--max-hl', type=float, default=None,
                         help='Max half-life in seconds (reject slow mean-reverters)')
     parser.add_argument('--direction', type=str, default=None, choices=['both', 'long', 'short'],
@@ -133,6 +135,8 @@ def apply_overrides(config: Config, args):
         config.sizing_method = args.sizing
     if args.max_entry_z is not None:
         config.max_entry_zscore = args.max_entry_z
+    if args.min_spread_bps is not None:
+        config.min_spread_bps = args.min_spread_bps
     if args.max_hl is not None:
         config.max_half_life_secs = args.max_hl
     if args.direction is not None:
@@ -277,11 +281,13 @@ async def run_monitor(config: Config, args):
         slippage_mon = SlippageMonitor(
             config, WELL_KNOWN_TOKENS, STABLECOIN_MINTS,
             poll_interval=300,
+            db=db,
         )
         slippage_mon.start()
 
-    risk_mgr = RiskManager(config, portfolio, slippage_monitor=slippage_mon)
-    sizer = PositionSizer(config)
+    # Wire slippage monitor into paper executor for dynamic per-token slippage
+    if slippage_mon and hasattr(executor, 'slippage_monitor'):
+        executor.slippage_monitor = slippage_mon
 
     # RL agent (optional)
     rl = None
@@ -289,6 +295,10 @@ async def run_monitor(config: Config, args):
         from rl_agent import RLDecisionMaker
         rl = RLDecisionMaker(config, db)
         logger.info(f"RL agent enabled: {rl.status_str()}")
+
+    risk_mgr = RiskManager(config, portfolio, slippage_monitor=slippage_mon,
+                            rl_enabled=(rl is not None))
+    sizer = PositionSizer(config)
 
     # Load cointegrated baskets
     num_pairs = signal_gen.load_baskets()
@@ -505,9 +515,11 @@ async def run_monitor(config: Config, args):
                     rl_size_mult = 1.0
                     if rl is not None:
                         from rl_agent import ACTION_PASS
-                        rl_action = rl.decide_entry(sig, basket_state, portfolio, risk_mgr)
+                        rl_action = rl.decide_entry(sig, basket_state, portfolio, risk_mgr,
+                                                     slippage_monitor=slippage_mon)
                         if rl_action == ACTION_PASS:
-                            rl.on_entry_skipped(sig, basket_state, portfolio, risk_mgr)
+                            rl.on_entry_skipped(sig, basket_state, portfolio, risk_mgr,
+                                                slippage_monitor=slippage_mon)
                             db.save_signal(sig, acted_on=False, reason="RL: PASS")
                             continue
                         from rl_agent import SIZE_MULTIPLIERS
@@ -525,15 +537,26 @@ async def run_monitor(config: Config, args):
                     if size is None:
                         continue
 
-                    # Cap size by slippage-adjusted max for this basket
+                    # Block baskets where worst token's round-trip slippage exceeds budget.
+                    # Scaling down doesn't help — slippage is proportional to size.
                     if slippage_mon is not None:
-                        basket_max = slippage_mon.get_basket_max_size(sig.mints)
-                        if basket_max > 0 and size.total_exposure_usd > basket_max:
-                            scale = basket_max / size.total_exposure_usd
-                            size.amounts = [a * scale for a in size.amounts]
-                            size.amounts_raw = [max(1, int(r * scale)) for r in size.amounts_raw]
-                            size.dollar_amounts = [d * scale for d in size.dollar_amounts]
-                            size.total_exposure_usd = basket_max
+                        from constants import SOL_MINT, STABLECOIN_MINTS
+                        slippage_budget_bps = 20
+                        worst_rt = 0
+                        worst_sym = ""
+                        for mint in sig.mints:
+                            if mint in STABLECOIN_MINTS or mint == SOL_MINT:
+                                continue
+                            rt = slippage_mon.get_slippage_at_size(
+                                mint, size.total_exposure_usd / max(sig.basket_size, 1))
+                            if rt is not None and rt > worst_rt:
+                                worst_rt = rt
+                                worst_sym = mint[:8]
+                        if worst_rt > slippage_budget_bps:
+                            db.save_signal(sig, acted_on=False,
+                                           reason="Slippage %s %.0fbps > %dbps budget" % (
+                                               worst_sym, worst_rt, slippage_budget_bps))
+                            continue
 
                     # Apply RL size multiplier
                     if rl is not None and rl_size_mult != 1.0:
@@ -611,7 +634,8 @@ async def run_monitor(config: Config, args):
                     if rl is not None and sig.signal_type == SignalType.EXIT:
                         exit_basket_state = signal_gen.get_basket_states().get(sig.pair_key)
                         should_exit = rl.decide_exit(
-                            sig, exit_basket_state, portfolio, risk_mgr, position)
+                            sig, exit_basket_state, portfolio, risk_mgr, position,
+                            slippage_monitor=slippage_mon)
                         if not should_exit:
                             db.save_signal(sig, acted_on=False, reason="RL: HOLD")
                             continue
