@@ -696,7 +696,7 @@ class LiveExecutor:
 
             logger.info(f"TX timing: quote={_ms(t0,t_quote)}ms swap_api={_ms(t_quote,t_swap_api)}ms "
                         f"sign={_ms(t_swap_api,t_sign)}ms submit={_ms(t_sign,t_submit)}ms "
-                        f"confirm={_ms(t_submit,t_confirm)}ms total={_ms(t0,t_confirm)}ms")
+                        f"total={_ms(t0,t_submit)}ms | confirm={_ms(t_submit,t_confirm)}ms")
 
             if on_chain_err:
                 last_error = f"Swap failed on-chain: {on_chain_err} (tx: {signature})"

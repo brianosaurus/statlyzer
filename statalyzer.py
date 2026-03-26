@@ -485,6 +485,7 @@ async def run_monitor(config: Config, args):
         'signals': 0,
         'trades': 0,
     }
+    _pending_entries = {}  # pair_key -> asyncio.Task for in-flight entry executions
     last_discovery_save = 0
     start_time = time.time()
     deadline = start_time + args.duration * 60 if args.duration else None
@@ -615,68 +616,78 @@ async def run_monitor(config: Config, args):
 
                     _t_decision = _time.monotonic()
 
-                    # Capture SOL balance before entry (live only)
-                    entry_sol_before, _ = _get_sol_before(config, executor)
-
-                    _t_exec_start = _time.monotonic()
-
-                    # Execute
-                    try:
-                        execution = await executor.execute_entry(sig, size, entry_prices)
-                    except Exception as e:
-                        logger.error(f"execute_entry failed for {sig.pair_key}: {e}")
-                        continue
-                    if execution is None:
-                        continue
-
-                    _t_exec_end = _time.monotonic()
-
-                    # Fill prices from execution
-                    fill_prices = [f.price for f in execution.fills]
-
-                    # Update position sizes with actual fill quantities
-                    # so exits sell exactly what was received, not the estimate
-                    for i, fill in enumerate(execution.fills):
-                        size.amounts[i] = fill.quantity
-                        size.amounts_raw[i] = fill.quantity_raw
-
-                    position = portfolio.open_position(
-                        sig, size, is_paper=config.paper_trade,
-                        prices=fill_prices,
-                        fees_usd=execution.estimated_fees_usd,
-                    )
-
-                    # Timing breakdown
-                    _t_done = _time.monotonic()
-                    _ms = lambda a, b: (b - a) * 1000
-                    from display import mints_to_label
-                    _label = mints_to_label(sig.mints)
-                    logger.info(
-                        f"TIMING {_label}: "
-                        f"decision={_ms(_t_signal, _t_decision):.1f}ms "
-                        f"exec={_ms(_t_exec_start, _t_exec_end):.1f}ms "
-                        f"total={_ms(_t_signal, _t_done):.1f}ms"
-                    )
-
-                    executor.log_execution(position.id, execution, 0)
-
-                    # Record entry SOL balance for reconciliation
-                    if entry_sol_before > 0 and hasattr(executor, 'get_sol_balance_and_slot_sync'):
-                        try:
-                            entry_sol_after, _ = executor.get_sol_balance_and_slot_sync()
-                            db.update_position_entry_sol(position.id, entry_sol_before, entry_sol_after)
-                        except Exception:
-                            pass
-                    risk_mgr.record_entry()
-                    stats['trades'] += 1
-
+                    # Mark basket as in-position immediately to prevent duplicate entries
                     basket_state.in_position = True
                     basket_state.position_entry_time = time.time()
                     basket_state.position_entry_zscore = sig.zscore
 
-                    print_entry(sig, position, execution)
+                    # Fire-and-forget entry execution
+                    async def _do_entry(_sig, _size, _entry_prices, _basket_state,
+                                        _t_signal, _t_decision):
+                        try:
+                            _entry_sol_before, _ = _get_sol_before(config, executor)
+                            _t_exec_start = _time.monotonic()
+
+                            execution = await executor.execute_entry(_sig, _size, _entry_prices)
+
+                            _t_exec_end = _time.monotonic()
+
+                            if execution is None:
+                                _basket_state.in_position = False
+                                logger.warning(f"Entry execution returned None for {_sig.pair_key}")
+                                return
+
+                            fill_prices = [f.price for f in execution.fills]
+                            for i, fill in enumerate(execution.fills):
+                                _size.amounts[i] = fill.quantity
+                                _size.amounts_raw[i] = fill.quantity_raw
+
+                            position = portfolio.open_position(
+                                _sig, _size, is_paper=config.paper_trade,
+                                prices=fill_prices,
+                                fees_usd=execution.estimated_fees_usd,
+                            )
+
+                            _t_done = _time.monotonic()
+                            _ms = lambda a, b: (b - a) * 1000
+                            from display import mints_to_label
+                            _label = mints_to_label(_sig.mints)
+                            logger.info(
+                                f"TIMING {_label}: "
+                                f"decision={_ms(_t_signal, _t_decision):.1f}ms "
+                                f"exec={_ms(_t_exec_start, _t_exec_end):.1f}ms "
+                                f"total={_ms(_t_signal, _t_done):.1f}ms"
+                            )
+
+                            executor.log_execution(position.id, execution, 0)
+
+                            if _entry_sol_before > 0 and hasattr(executor, 'get_sol_balance_and_slot_sync'):
+                                try:
+                                    _entry_sol_after, _ = executor.get_sol_balance_and_slot_sync()
+                                    db.update_position_entry_sol(position.id, _entry_sol_before, _entry_sol_after)
+                                except Exception:
+                                    pass
+
+                            risk_mgr.record_entry()
+                            stats['trades'] += 1
+                            print_entry(_sig, position, execution)
+
+                        except Exception as e:
+                            logger.error(f"Async entry failed for {_sig.pair_key}: {e}")
+                            _basket_state.in_position = False
+                        finally:
+                            _pending_entries.pop(_sig.pair_key, None)
+
+                    task = asyncio.create_task(_do_entry(
+                        sig, size, entry_prices, basket_state,
+                        _t_signal, _t_decision))
+                    _pending_entries[sig.pair_key] = task
 
                 elif sig.signal_type in (SignalType.EXIT, SignalType.STOP_LOSS):
+                    # Wait for pending entry to complete before attempting exit
+                    pending = _pending_entries.get(sig.pair_key)
+                    if pending is not None:
+                        await pending
                     if not portfolio.has_position(sig.pair_key):
                         continue
 

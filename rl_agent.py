@@ -104,18 +104,20 @@ class RunningNormalizer:
         self.count = 0
 
     def update(self, x: np.ndarray):
+        x = np.nan_to_num(x.astype(np.float64), nan=0.0, posinf=1e6, neginf=-1e6)
         self.count += 1
         if self.count == 1:
-            self.mean = x.astype(np.float64).copy()
+            self.mean = x.copy()
             self.var = np.zeros(len(x), dtype=np.float64)
         else:
-            delta = x.astype(np.float64) - self.mean
+            delta = x - self.mean
             self.mean += delta / self.count
-            self.var += delta * (x.astype(np.float64) - self.mean)
+            self.var += delta * (x - self.mean)
 
     def normalize(self, x: np.ndarray) -> np.ndarray:
         std = np.sqrt(self.var / max(self.count - 1, 1)) + 1e-8
-        return ((x.astype(np.float64) - self.mean) / std).astype(np.float32)
+        result = ((x.astype(np.float64) - self.mean) / std).astype(np.float32)
+        return np.nan_to_num(result, nan=0.0, posinf=10.0, neginf=-10.0)
 
     def state_dict(self) -> dict:
         return {
@@ -625,6 +627,9 @@ class RLDecisionMaker:
                 b_mask = mask_t[idx]
 
                 logits, values = self.network(b_obs, action_mask=b_mask)
+                if torch.isnan(logits).any():
+                    logger.warning("NaN logits in PPO update — skipping batch")
+                    continue
                 dist = torch.distributions.Categorical(logits=logits)
                 new_lp = dist.log_prob(b_actions)
                 entropy = dist.entropy().mean()
