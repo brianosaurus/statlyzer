@@ -34,6 +34,12 @@ class Config:
     stop_loss_zscore: float = float(os.getenv('STOP_LOSS_ZSCORE', '4.0'))
     max_entry_zscore: float = float(os.getenv('MAX_ENTRY_ZSCORE', '3.0'))
     min_spread_bps: float = float(os.getenv('MIN_SPREAD_BPS', '0'))  # min abs spread deviation in bps to enter
+    max_basket_size: int = int(os.getenv('MAX_BASKET_SIZE', '99'))  # max tokens per basket (2=pairs only)
+    regime_caution_threshold: float = float(os.getenv('REGIME_CAUTION', '0.4'))
+    regime_danger_threshold: float = float(os.getenv('REGIME_DANGER', '0.7'))
+    regime_ema_alpha: float = float(os.getenv('REGIME_EMA_ALPHA', '0.1'))
+    regime_caution_size_mult: float = float(os.getenv('REGIME_CAUTION_SIZE', '0.5'))
+    regime_caution_entry_z_mult: float = float(os.getenv('REGIME_CAUTION_Z', '1.3'))
     allowed_direction: str = os.getenv('ALLOWED_DIRECTION', 'both')  # both, long, short
 
     # Position sizing

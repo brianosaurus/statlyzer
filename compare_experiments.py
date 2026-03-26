@@ -25,14 +25,12 @@ EXPERIMENTS = {
     # Phase 4: LST-only (pure LST baskets, realistic 1bps)
     "LL": {"db": "exp_ll.db", "label": "LST $10k",
             "desc": "40pos/10tok/5x/7%/z2.0-4.0/ez0.2/1bps/30s/LST/LL/$10k"},
-    # Phase 5: Reinforcement learning
-    "RL": {"db": "exp_rl.db", "label": "RL LST $10k",
-            "desc": "40pos/10tok/5x/7%/z2.0-4.0/ez0.2/1bps/30s/LST/RL+KF/$10k"},
-    # Phase 7: RL on LL's proven LST universe
-    "PP": {"db": "exp_pp.db", "label": "RL+LL $10k",
-            "desc": "40pos/10tok/5x/7%/z2.0-4.0/ez0.2/1bps/30s/LST/RL/$10k"},
-    "QQ": {"db": "exp_qq.db", "label": "RL+LL $20k",
-            "desc": "40pos/10tok/5x/7%/z2.0-4.0/ez0.2/1bps/30s/LST/RL/$20k"},
+    # $5k aggressive with Lunar Lander fees
+    "5K": {"db": "exp_5k.db", "label": "LST $5k 12%",
+            "desc": "40pos/10tok/5x/12%/z1.0-6.0/ez0.1/3bps/30s/LST/LL/$5k"},
+    # $5k max risk with Lunar Lander fees
+    "5X": {"db": "exp_5x.db", "label": "LST $5k MAX",
+            "desc": "40pos/20tok/10x/18%/z1.0-6.0/ez0.1/3bps/30s/LST/LL/$5k"},
 }
 
 
@@ -149,7 +147,9 @@ def analyze_experiment(name: str, info: dict, since_restart: bool,
 
     now = time.time()
 
-    if since_restart:
+    if 'since' in info:
+        start_time = info['since']
+    elif since_restart:
         start_time = detect_restart_time(conn)
     elif snapshot_time > 0:
         row = conn.execute(

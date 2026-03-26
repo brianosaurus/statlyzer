@@ -29,8 +29,9 @@ from db import Database
 from display import (
     print_banner, print_signal, print_entry, print_exit,
     print_positions, print_zscore_dashboard, print_progress, print_summary,
-    print_discovery_status,
+    print_discovery_status, print_regime_status,
 )
+from regime import RegimeDetector
 
 logger = logging.getLogger(__name__)
 
@@ -81,6 +82,8 @@ def parse_args():
                         help='Max entry z-score (reject entries above this)')
     parser.add_argument('--min-spread-bps', type=float, default=None,
                         help='Min absolute spread deviation in bps to enter (e.g. 10)')
+    parser.add_argument('--max-basket-size', type=int, default=None,
+                        help='Max basket size (2=pairs only, 3=up to 3-token, etc)')
     parser.add_argument('--max-hl', type=float, default=None,
                         help='Max half-life in seconds (reject slow mean-reverters)')
     parser.add_argument('--direction', type=str, default=None, choices=['both', 'long', 'short'],
@@ -89,6 +92,8 @@ def parse_args():
                         help='Candle resample interval in seconds (default: 300)')
     parser.add_argument('--slippage-bps', type=int, default=None,
                         help='Slippage in basis points (default: from .env)')
+    parser.add_argument('--slippage-budget', type=int, default=20,
+                        help='Max round-trip slippage budget in bps to enter (default: 20)')
     parser.add_argument('--max-per-hour', type=int, default=None,
                         help='Max new positions per hour (default: 5)')
     parser.add_argument('--no-paper-errors', action='store_true',
@@ -102,6 +107,8 @@ def parse_args():
                              '(e.g. bSOL,mSOL,jitoSOL,jupSOL,BONK)')
     parser.add_argument('--rl', action='store_true',
                         help='Enable RL agent for entry/exit decisions (learns to maximize $/day)')
+    parser.add_argument('--classifier', type=str, default=None,
+                        help='Path to trade classifier model (e.g. trade_clf.pkl)')
     parser.add_argument('--verbose', action='store_true',
                         help='Enable debug logging')
     return parser.parse_args()
@@ -137,6 +144,8 @@ def apply_overrides(config: Config, args):
         config.max_entry_zscore = args.max_entry_z
     if args.min_spread_bps is not None:
         config.min_spread_bps = args.min_spread_bps
+    if args.max_basket_size is not None:
+        config.max_basket_size = args.max_basket_size
     if args.max_hl is not None:
         config.max_half_life_secs = args.max_hl
     if args.direction is not None:
@@ -296,8 +305,22 @@ async def run_monitor(config: Config, args):
         rl = RLDecisionMaker(config, db)
         logger.info(f"RL agent enabled: {rl.status_str()}")
 
+    # Trade classifier (optional)
+    trade_clf = None
+    if args.classifier:
+        from trade_classifier import TradeClassifier
+        trade_clf = TradeClassifier(args.classifier)
+        if trade_clf.is_ready():
+            logger.info(f"Trade classifier loaded from {args.classifier}")
+        else:
+            logger.warning(f"Trade classifier not found at {args.classifier} — disabled")
+            trade_clf = None
+
+    regime_detector = RegimeDetector(config)
+    signal_gen.regime_detector = regime_detector
+
     risk_mgr = RiskManager(config, portfolio, slippage_monitor=slippage_mon,
-                            rl_enabled=(rl is not None))
+                            rl_enabled=(rl is not None), regime_detector=regime_detector)
     sizer = PositionSizer(config)
 
     # Load cointegrated baskets
@@ -479,6 +502,9 @@ async def run_monitor(config: Config, args):
             # Process prices through signal generator
             signals = signal_gen.process_prices(prices, now_ts)
 
+            # Update regime detector
+            regime_detector.update(signal_gen.get_basket_states(), portfolio)
+
             # Sync SOL/USD price to executor for fee estimation
             if hasattr(executor, 'sol_usd_price') and signal_gen.sol_usd_price > 0:
                 executor.sol_usd_price = signal_gen.sol_usd_price
@@ -511,6 +537,16 @@ async def run_monitor(config: Config, args):
                     if not risk_check.allowed:
                         continue
 
+                    # Trade classifier filter (if enabled)
+                    if trade_clf is not None:
+                        clf_features = trade_clf.build_features(
+                            sig, basket_state, portfolio, slippage_mon)
+                        if not trade_clf.predict_profitable(clf_features):
+                            prob = trade_clf.predict_proba(clf_features)
+                            db.save_signal(sig, acted_on=False,
+                                           reason="Classifier: %.0f%% unprofitable" % ((1 - prob) * 100))
+                            continue
+
                     # RL entry decision (if enabled)
                     rl_size_mult = 1.0
                     if rl is not None:
@@ -525,6 +561,9 @@ async def run_monitor(config: Config, args):
                         from rl_agent import SIZE_MULTIPLIERS
                         rl_size_mult = SIZE_MULTIPLIERS.get(rl_action, 1.0)
 
+                    import time as _time
+                    _t_signal = _time.monotonic()
+
                     # Get current prices for all mints in basket
                     entry_prices = [signal_gen.token_prices.get(m, 0) for m in sig.mints]
                     if any(p <= 0 for p in entry_prices):
@@ -533,7 +572,8 @@ async def run_monitor(config: Config, args):
                     # Size the position
                     exposure = portfolio.get_total_exposure()
                     portfolio_value = portfolio.get_total_value()
-                    size = sizer.compute_size(sig, portfolio_value, exposure, entry_prices)
+                    size = sizer.compute_size(sig, portfolio_value, exposure, entry_prices,
+                                              regime_multiplier=regime_detector.get_size_multiplier())
                     if size is None:
                         continue
 
@@ -541,7 +581,7 @@ async def run_monitor(config: Config, args):
                     # Scaling down doesn't help — slippage is proportional to size.
                     if slippage_mon is not None:
                         from constants import SOL_MINT, STABLECOIN_MINTS
-                        slippage_budget_bps = 20
+                        slippage_budget_bps = args.slippage_budget
                         worst_rt = 0
                         worst_sym = ""
                         for mint in sig.mints:
@@ -573,8 +613,12 @@ async def run_monitor(config: Config, args):
                             db.save_signal(sig, acted_on=False, reason=reject_reason)
                             continue
 
+                    _t_decision = _time.monotonic()
+
                     # Capture SOL balance before entry (live only)
                     entry_sol_before, _ = _get_sol_before(config, executor)
+
+                    _t_exec_start = _time.monotonic()
 
                     # Execute
                     try:
@@ -584,6 +628,8 @@ async def run_monitor(config: Config, args):
                         continue
                     if execution is None:
                         continue
+
+                    _t_exec_end = _time.monotonic()
 
                     # Fill prices from execution
                     fill_prices = [f.price for f in execution.fills]
@@ -598,6 +644,18 @@ async def run_monitor(config: Config, args):
                         sig, size, is_paper=config.paper_trade,
                         prices=fill_prices,
                         fees_usd=execution.estimated_fees_usd,
+                    )
+
+                    # Timing breakdown
+                    _t_done = _time.monotonic()
+                    _ms = lambda a, b: (b - a) * 1000
+                    from display import mints_to_label
+                    _label = mints_to_label(sig.mints)
+                    logger.info(
+                        f"TIMING {_label}: "
+                        f"decision={_ms(_t_signal, _t_decision):.1f}ms "
+                        f"exec={_ms(_t_exec_start, _t_exec_end):.1f}ms "
+                        f"total={_ms(_t_signal, _t_done):.1f}ms"
                     )
 
                     executor.log_execution(position.id, execution, 0)
@@ -670,6 +728,8 @@ async def run_monitor(config: Config, args):
                         position.current_prices[i] = fill.price
 
                     reason = "stop_loss" if sig.signal_type == SignalType.STOP_LOSS else "mean_reversion"
+                    if sig.signal_type == SignalType.STOP_LOSS:
+                        regime_detector.on_stop_loss()
                     closed = portfolio.close_position(sig.pair_key, sig.zscore, 0, reason,
                                                       exit_fees_usd=execution.estimated_fees_usd)
                     if closed:
@@ -843,6 +903,7 @@ async def run_monitor(config: Config, args):
                 print_positions(portfolio.positions, portfolio.get_total_value(),
                                 signal_gen.get_basket_states(), config.max_position_age_half_lives)
                 print_discovery_status(signal_gen.discovery, signal_gen.get_basket_states())
+                print_regime_status(regime_detector)
                 if slippage_mon is not None:
                     print(f"  {slippage_mon.status_str()}")
                 if rl is not None:

@@ -175,6 +175,12 @@ def print_discovery_status(discovery, baskets=None):
     print(status)
 
 
+def print_regime_status(regime_detector):
+    """Print current regime detection status."""
+    if regime_detector is not None:
+        print(f"  {regime_detector.status_str()}")
+
+
 def print_summary(portfolio, db, elapsed: float):
     """Print session summary on exit."""
     stats = db.get_stats()

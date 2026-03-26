@@ -20,11 +20,12 @@ class RiskCheck:
 class RiskManager:
     """Evaluates risk before allowing new positions."""
 
-    def __init__(self, config, portfolio, slippage_monitor=None, rl_enabled=False):
+    def __init__(self, config, portfolio, slippage_monitor=None, rl_enabled=False, regime_detector=None):
         self.config = config
         self.portfolio = portfolio
         self.slippage_monitor = slippage_monitor
         self.rl_enabled = rl_enabled
+        self.regime_detector = regime_detector
         self.entries_this_hour: list = []  # timestamps
         self.kill_switch: bool = False
         self.kill_switch_time: float = 0  # when kill switch was engaged
@@ -36,6 +37,12 @@ class RiskManager:
         # if self.kill_switch:
         #     pass
 
+        # 1a. Regime check — block entries in danger mode
+        if self.regime_detector is not None:
+            regime = self.regime_detector.get_regime()
+            if regime == "danger":
+                return RiskCheck(False, "Regime: danger — pausing entries")
+
         # 1b. Entry z-score cap
         # When RL is enabled, widen to stop_loss * 0.9 (RL decides via PASS)
         # Without RL, use the configured max_entry_zscore
@@ -46,6 +53,12 @@ class RiskManager:
             hard_cap = self.config.max_entry_zscore
         if abs_z > hard_cap:
             return RiskCheck(False, f"|z|={abs_z:.1f} > max entry {hard_cap:.1f}")
+
+        # 1c. In caution regime, require higher z to enter
+        if self.regime_detector and self.regime_detector.get_regime() == "caution":
+            effective_entry_z = abs_z / self.regime_detector.get_entry_z_multiplier()
+            if effective_entry_z < self.config.entry_zscore:
+                return RiskCheck(False, f"Regime: caution — effective |z|={effective_entry_z:.1f} < entry {self.config.entry_zscore:.1f}")
 
         # 2. Already in this pair
         if self.portfolio.has_position(signal.pair_key):

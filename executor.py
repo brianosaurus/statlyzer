@@ -1179,8 +1179,17 @@ class LiveExecutor:
                     errors.append(str(e))
                     break
 
-        # Merge SOL fills + swap fills
-        fills = sol_fills + fills
+        # Merge all fills, ordered by original leg index
+        indexed_fills = []
+        for idx_val, side, qty, qty_raw, price in sol_legs:
+            f = next((f for f in sol_fills if f.token_mint == SOL_MINT and f.side == side), None)
+            if f:
+                indexed_fills.append((idx_val, f))
+        for f in fills:
+            idx_val = next((j for j, m in enumerate(signal.mints) if m == f.token_mint), len(indexed_fills))
+            indexed_fills.append((idx_val, f))
+        indexed_fills.sort(key=lambda x: x[0])
+        fills = [f for _, f in indexed_fills]
 
         if not fills:
             raise RuntimeError(f"All entry legs failed — {'; '.join(errors)}")
@@ -1391,8 +1400,20 @@ class LiveExecutor:
                 else:
                     logger.error(f"Post-exit sweep of {mint[:8]}.. failed — tokens orphaned")
 
-        # Merge SOL fills + zero-balance fills + swap fills
-        fills = [f for _, f in sol_fills] + zero_balance_fills + swap_fills
+        # Merge all fills, ordered by original leg index
+        indexed_fills = []
+        for i, f in sol_fills:
+            indexed_fills.append((i, f))
+        # zero_balance_fills don't have indices — find their position from token_mint
+        for f in zero_balance_fills:
+            idx = next((j for j, m in enumerate(position.mints) if m == f.token_mint), len(indexed_fills))
+            indexed_fills.append((idx, f))
+        # swap_fills are in the same order as legs — recover index from leg's token_mint
+        for f in swap_fills:
+            idx = next((j for j, m in enumerate(position.mints) if m == f.token_mint), len(indexed_fills))
+            indexed_fills.append((idx, f))
+        indexed_fills.sort(key=lambda x: x[0])
+        fills = [f for _, f in indexed_fills]
 
         return BasketExecution(fills=fills, is_paper=False,
                                estimated_fees_usd=self._estimate_fees_usd(len(legs)))

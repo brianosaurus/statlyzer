@@ -485,6 +485,8 @@ class Database:
 
     # --- Price candle persistence (warmup avoidance) ---
 
+    _candle_count: Dict[str, int] = {}
+
     def save_candle(self, basket_key: str, timestamp: float,
                     log_prices: List[float]) -> None:
         self.conn.execute(
@@ -493,6 +495,11 @@ class Database:
             (basket_key, timestamp, json.dumps(log_prices)),
         )
         self.conn.commit()
+        # Auto-prune every 50 inserts per basket to prevent DB bloat
+        self._candle_count[basket_key] = self._candle_count.get(basket_key, 0) + 1
+        if self._candle_count[basket_key] >= 50:
+            self.trim_candles(basket_key, keep=120)
+            self._candle_count[basket_key] = 0
 
     def load_candles(self, basket_key: str, limit: int = 100) -> List[tuple]:
         """Load most recent candles for a basket, ordered oldest-first.

@@ -36,7 +36,8 @@ class PositionSizer:
 
     def compute_size(self, signal: Signal, portfolio_value: float,
                      current_exposure: float,
-                     prices: List[float]) -> Optional[PositionSize]:
+                     prices: List[float],
+                     regime_multiplier: float = 1.0) -> Optional[PositionSize]:
         """
         Compute position size for a basket entry.
 
@@ -65,6 +66,9 @@ class PositionSizer:
         if abs_z > entry_z and entry_z > 0:
             conviction = 1.0 + 0.5 * min((abs_z - entry_z) / entry_z, 1.0)
             dollar_size *= conviction
+
+        # Apply regime-based size scaling
+        dollar_size *= regime_multiplier
 
         if dollar_size <= 0:
             return None

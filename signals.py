@@ -190,6 +190,8 @@ class SignalGenerator:
         self.pair_reload_interval = 900  # 15 minutes
         self.sol_usd_price: float = 0.0  # cached SOL/USD
 
+        self.regime_detector = None  # Set externally for regime-aware exit timing
+
         # Inline cointegration discovery
         from cointegration import CointegrationDiscovery
         self.discovery = CointegrationDiscovery(config, WELL_KNOWN_TOKENS, STABLECOIN_MINTS)
@@ -548,6 +550,9 @@ class SignalGenerator:
             if self.config.token_whitelist_mints:
                 if not all(m in self.config.token_whitelist_mints for m in basket.mints):
                     return None
+            # Basket size filter
+            if basket.basket_size > self.config.max_basket_size:
+                return None
 
         return Signal(
             signal_type=signal_type,
@@ -597,6 +602,63 @@ class SignalGenerator:
         basket.current_zscore = z
         basket.current_spread = live_spread
 
+    def _get_recent_spread(self, basket: BasketState, n: int = 10) -> Optional[np.ndarray]:
+        """Compute spread from last n buffer entries."""
+        arrays = [buf.get_array() for buf in basket.price_buffers]
+        if len(arrays[0]) < n:
+            return None
+        price_matrix = np.column_stack(arrays)[-n:]
+        hr = np.array(basket.hedge_ratios)
+        return price_matrix @ hr
+
+    def _compute_exit_threshold(self, basket: BasketState) -> float:
+        """Dynamic exit z-score threshold based on spread velocity and position age."""
+        base = self.config.exit_zscore
+
+        # Z-velocity from last 10 spread values
+        recent = self._get_recent_spread(basket, n=10)
+        if recent is not None and len(recent) >= 3:
+            try:
+                x = np.arange(len(recent), dtype=np.float64)
+                coeffs = np.polyfit(x, recent, 1)
+                slope = coeffs[0]
+                spread_range = np.std(recent)
+
+                if spread_range > 1e-12:
+                    # Normalized velocity: positive = spread increasing
+                    norm_velocity = slope / spread_range
+
+                    # Determine if reverting toward mean or away
+                    # For a long position (entered at -z), reversion means spread increasing
+                    # For a short position (entered at +z), reversion means spread decreasing
+                    entry_z = basket.position_entry_zscore
+                    if entry_z < 0:
+                        # Long: want spread to go up (positive velocity = reverting)
+                        is_reverting = norm_velocity > 0.3
+                        is_stalled = norm_velocity < -0.1
+                    else:
+                        # Short: want spread to go down (negative velocity = reverting)
+                        is_reverting = norm_velocity < -0.3
+                        is_stalled = norm_velocity > 0.1
+
+                    if is_reverting:
+                        base *= 0.6  # Hold longer — momentum in our favor
+                    elif is_stalled:
+                        base *= 1.5  # Exit sooner — adverse movement
+            except (np.linalg.LinAlgError, ValueError):
+                pass
+
+        # Position age vs half-life
+        if basket.position_entry_time > 0 and basket.half_life > 0:
+            age_secs = time.time() - basket.position_entry_time
+            hl_secs = basket.half_life * 0.4  # blocks to seconds
+            if hl_secs > 0 and age_secs > 1.5 * hl_secs:
+                base *= 1.3  # Getting old — exit sooner
+
+        # Clamp
+        base = max(0.1, min(1.0, base))
+        return base
+
     def _check_signal(self, basket: BasketState) -> Optional[SignalType]:
         z = basket.current_zscore
 
@@ -631,7 +693,7 @@ class SignalGenerator:
             cooldown_secs = self.config.entry_cooldown_slots / 2.5
             if (time.time() - basket.position_entry_time) >= cooldown_secs:
                 # Exit if z is within exit band
-                if abs(z) < self.config.exit_zscore:
+                if abs(z) < self._compute_exit_threshold(basket):
                     return SignalType.EXIT
                 # Exit if z crossed through the mean (overshot)
                 # Short entered at +z, exit if z went negative (and vice versa)
